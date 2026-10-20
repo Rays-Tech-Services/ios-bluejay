@@ -1041,6 +1041,7 @@ static void zero32(u64 a, u32 n)
 }
 
 static u8 ufs_tag;
+static u64 ufs_ucd_override;	/* 0: the shim's buffer, else ABL's command buffer */
 
 /*
  * One SCSI command in UTRD slot `slot` of the list at `list`, Exynos format
@@ -1049,7 +1050,7 @@ static u8 ufs_tag;
  */
 static u32 ufs_cmd(u64 hci, u64 list, int slot, u8 lun, const u8 *cdb, int cdb_len, u64 data, u32 len)
 {
-	u64 ucd = sym_addr_ucd(), utrd = list + 32 * slot;
+	u64 ucd = ufs_ucd_override ? ufs_ucd_override : sym_addr_ucd(), utrd = list + 32 * slot;
 	zero32(ucd, 1024 + 16);
 	zero32(utrd, 32);
 	wr32(ucd + 0, (u32)0x01 | (len ? 0x40u : 0) << 8 | (u32)lun << 16 | (u32)(++ufs_tag) << 24);
@@ -1087,26 +1088,64 @@ static u32 ufs_cmd(u64 hci, u64 list, int slot, u8 lun, const u8 *cdb, int cdb_l
 	return (r1 >> 16) & 0xffff ? 0x100 | ((r1 >> 24) & 0xff) : 0;
 }
 
-static void ufs_try(const char *label, u64 hci, u64 list, int slot, u64 data)
+#define UFS_UTRLCLR	0x5c
+#define UFS_UICCMD	0x90
+#define UFS_UICARG1	0x94
+#define UFS_UICARG2	0x98
+#define UFS_UICARG3	0x9c
+
+/* Clear a pending slot (Exynos UTRLCLR clears with 1 bits); 1 if it cleared. */
+static int ufs_clear_slot(u64 hci, int slot)
+{
+	if (!(rd32(hci + UFS_DBR) & (1u << slot)))
+		return 1;
+	wr32(hci + UFS_UTRLCLR, 1u << slot);
+	for (int i = 0; i < 1000 && (rd32(hci + UFS_DBR) & (1u << slot)); i++)
+		delay_ms(1);
+	return !(rd32(hci + UFS_DBR) & (1u << slot));
+}
+
+static u32 ufs_tur(u64 hci, u64 list, int slot)
 {
 	static const u8 tur[6] = { 0 };
-	static const u8 rd10[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0 };	/* READ(10) LBA 1, 1 block */
-	u32 e = 0;
-	for (int i = 0; i < 3 && (e = ufs_cmd(hci, list, slot, 0, tur, 6, 0, 0)); i++)
-		;
+	u32 e = 0x200;
+	for (int i = 0; i < 3; i++) {
+		if (!ufs_clear_slot(hci, slot))
+			return 0x400;			/* doorbell stuck even after UTRLCLR */
+		if (!(e = ufs_cmd(hci, list, slot, 0, tur, 6, 0, 0)))
+			break;
+	}
+	return e;
+}
+
+static void ufs_show(const char *label, u64 hci, u32 e)
+{
 	puts_(label);
 	puts_(" TUR ");
 	puthex(e, 3);
-	if (e == 0) {
-		zero32(data, 16);
-		e = ufs_cmd(hci, list, slot, 0, rd10, 10, data, 4096);
-		puts_(" READ ");
-		puthex(e, 3);
-		u32 a = rd32(data), b = rd32(data + 4);
-		puts_(a == 0x20494645 && b == 0x54524150 ? "  EFI PART: OK" : "  no GPT");
-	}
+	puts_(e == 0 ? " OK" : e == 0x200 ? " timeout" : e == 0x400 ? " slot stuck" : " error");
 	newline();
-	kv2("     IS ", rd32(hci + UFS_IS), " DBR ", rd32(hci + UFS_DBR));
+	kv2("     IS ", rd32(hci + UFS_IS), " HCS ", rd32(hci + UFS_HCS));
+	wr32(hci + UFS_IS, rd32(hci + UFS_IS));
+}
+
+/* UIC command; returns ARG2 result code (0 ok) or 0x100 on timeout */
+static u32 ufs_uic(u64 hci, u32 cmd, u32 arg1, u32 *arg3)
+{
+	for (int i = 0; i < 100 && !(rd32(hci + UFS_HCS) & 8); i++)	/* UCRDY */
+		delay_ms(1);
+	wr32(hci + UFS_IS, 1u << 10);					/* UCCS */
+	wr32(hci + UFS_UICARG1, arg1);
+	wr32(hci + UFS_UICARG2, 0);
+	wr32(hci + UFS_UICARG3, 0);
+	wr32(hci + UFS_UICCMD, cmd);
+	u64 t0 = now();
+	while (!(rd32(hci + UFS_IS) & (1u << 10)))
+		if (now() - t0 > timer_hz / 2)
+			return 0x100;
+	if (arg3)
+		*arg3 = rd32(hci + UFS_UICARG3);
+	return rd32(hci + UFS_UICARG2) & 0xff;
 }
 
 static void diag_ufs_test(u64 dtb)
@@ -1121,32 +1160,48 @@ static void diag_ufs_test(u64 dtb)
 			node_reg(&f, 1, &vs, &vss);
 			break;
 		}
-	if (!hci) {
+	if (!hci || !vs) {
 		say(C_DIM, "  no Exynos UFS node: skipped");
 		return;
 	}
-	u64 abl_list = rd32(hci + UFS_UTRLBA) | (u64)rd32(hci + UFS_UTRLBAU) << 32;
-	kv2("  RSR ", rd32(hci + UFS_RSR), " list ", abl_list);
-	/* 1. ABL's list, slot 1 (its nexus bit is set), data in the shim (low DRAM) */
-	ufs_try("  A abl list s1 low", hci, abl_list, 1, sym_addr_data());
-	/* 2. same, data buffer in XNU's RAM (high bank, 36-bit DMA) */
-	ufs_try("  B abl list s1 high", hci, abl_list, 1, 0x880000000UL);
-	/* 3. slot 0 after setting its nexus bit (what the kernel does) */
-	if (vs) {
-		wr32(vs + 0x40, rd32(vs + 0x40) | 1);
-		ufs_try("  C abl list s0 low", hci, abl_list, 0, sym_addr_data());
+	u64 list = rd32(hci + UFS_UTRLBA) | (u64)rd32(hci + UFS_UTRLBAU) << 32;
+	/* E1: where ABL left things */
+	kv2("  E1 CLKSTOP ", rd32(vs + 0xb0), " MISC ", rd32(vs + 0xb4));
+	kv2("     IS ", rd32(hci + UFS_IS), " HCS ", rd32(hci + UFS_HCS));
+	kv2("     list ", list, " RSR ", rd32(hci + UFS_RSR));
+	u64 abl_ucd = rd32(list + 16) | (u64)rd32(list + 20) << 32;
+	kv2("     ABL s0 dw0 ", rd32(list), " ucd ", abl_ucd);
+	kv2("     ABL s0 resp/prdt ", rd32(list + 24), " ", rd32(list + 28));
+	if (abl_ucd)
+		kv2("     ABL cmd upiu ", rd32(abl_ucd), " ", rd32(abl_ucd + 16));
+	u32 pm = 0;
+	u32 r = ufs_uic(hci, 0x01, 0x1571u << 16, &pm);		/* DME_GET PA_PWRMODE */
+	kv2("     DME_GET PA_PWRMODE result ", r, " value ", pm);
+	/* E2: ABL's list and ABL's command buffer: only memory the controller already used */
+	if (abl_ucd && abl_ucd < 0x100000000UL)
+		ufs_ucd_override = abl_ucd;
+	ufs_show("  E2 abl ucd", hci, ufs_tur(hci, list, 1));
+	/* E3: un-gate the controller clocks like Linux (exynos_ufs_ctrl_clkstop(false)) */
+	wr32(vs + 0xb0, rd32(vs + 0xb0) & ~0x1fu);
+	wr32(vs + 0xb4, rd32(vs + 0xb4) & ~0xe0u);
+	kv2("  E3 CLKSTOP ", rd32(vs + 0xb0), " MISC ", rd32(vs + 0xb4));
+	ufs_show("  E3 ungated", hci, ufs_tur(hci, list, 1));
+	/* E4: link out of Hibern8 */
+	r = ufs_uic(hci, 0x18, 0, 0);					/* DME_HIBERNATE_EXIT */
+	delay_ms(5);
+	kv2("  E4 H8 exit result ", r, " HCS ", rd32(hci + UFS_HCS));
+	u32 e = ufs_tur(hci, list, 1);
+	ufs_show("  E4 after H8 exit", hci, e);
+	if (e == 0) {
+		static const u8 rd10[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0 };
+		u64 data = sym_addr_data();
+		zero32(data, 16);
+		ufs_clear_slot(hci, 1);
+		e = ufs_cmd(hci, list, 1, 0, rd10, 10, data, 4096);
+		kv2("  E4 READ LBA1 ", e, " first word ", rd32(data));
+		say(rd32(data) == 0x20494645 ? C_OK : C_WARN,
+		    rd32(data) == 0x20494645 ? "  EFI PART: storage works" : "  no GPT header");
 	}
-	/* 4. our own list in low DRAM: base rewritten while RSR = 1 (the kernel's way) */
-	u64 own = sym_addr_list();
-	wr32(hci + UFS_RSR, 0);
-	wr32(hci + UFS_UTRLBA, (u32)own);
-	wr32(hci + UFS_UTRLBAU, (u32)(own >> 32));
-	wr32(hci + UFS_RSR, 1);
-	kv2("  own list ", own, " RSR ", rd32(hci + UFS_RSR));
-	ufs_try("  D own list s1 low", hci, own, 1, sym_addr_data());
-	/* put ABL's list back */
-	wr32(hci + UFS_UTRLBA, (u32)abl_list);
-	wr32(hci + UFS_UTRLBAU, (u32)(abl_list >> 32));
 }
 
 static void __attribute__((noreturn)) diag(u64 dtb)
