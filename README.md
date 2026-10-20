@@ -2,7 +2,7 @@
 
 A port of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (iOS 16 on the Redmi Note 10 Pro) and [iOS16-on-A40](https://github.com/tlfares/iOS16-on-A40) (the same on the Galaxy A40) to the **Google Pixel 6a** (`bluejay`, Google Tensor / GS101), plus a **QEMU setup** that runs the Pixel boot chain on a Mac or Linux PC.
 
-> **Status (2026-10-20): not yet run on a Pixel 6a.** The bluejay kernel builds on GitHub Actions (`xnu-bluejay` workflow, run 39490131821) and boots in QEMU through the real shim: EL2 entry, GICv3 timer (INTID 27), framebuffer driver at `0xfac00000`, kernel log on the serial console, virtio disk, HFS+ `userdata` root, then `exec /sbin/launchd` (`tools/qemu-smoke.sh` passes). Nothing Pixel-specific below the shim has run on hardware: the hardware facts come from mainline Linux and the Pixel 6 device tree, the ones not measured on a 6a are marked **VERIFY** in [docs/hardware.md](docs/hardware.md), and the shim's diagnostic boot checks each of them.
+> **Status (2026-10-20): iOS 16 boots to the lock screen in QEMU; not yet run on a Pixel 6a.** The bluejay kernel (built by the `xnu-bluejay` workflow) boots through the real shim on QEMU's virt board, set up like the Pixel (EL2 entry, GICv3, Pixel memory map), mounts the iOS 16.7.16 root from a virtio disk, and SpringBoard draws the lock screen (clock, battery, camera button) through the kernel's display driver: `tools/qemu-ios.sh`. On real hardware nothing has run yet: the hardware facts come from Google's bluejay kernel tree, mainline Linux and the Pixel 6 device tree, the unmeasured ones are marked **VERIFY** in [docs/hardware.md](docs/hardware.md), and the shim's diagnostic boot checks each of them (including display refresh and the touch chip).
 
 ## Why the Pixel 6a is a good target
 
@@ -72,7 +72,19 @@ python3 tools/qemu-bluejay.py out/q/Image out/run --disk disk.img --snapshot --s
 
 Output in `out/run/`: `serial.txt` (shim log, and the kernel log with the bluejay kernel), `fb.png` (the 1080×2400 screen, refreshed every `--watch` seconds), `fb.txt` (the screen as text; add `--xnu-src build/xnu` to read the kernel's font), `regs.txt`, `qemu.log`, `result.json`. Other options: `--el1` (enter at EL1), `--initrd-payload` (payload behind a fake vendor ramdisk), `--bootargs '... shimdiag'` (diagnostic screen), `--gdb`.
 
-A disk with a real iOS root: build `root.img` as in `docs/bringup.md` step 5, then `python3 tools/mkdisk.py root.img disk.img`. A full boot to the lock screen took about 40 minutes under TCG on the A40 port.
+**Booting iOS itself** (the iPhone X 16.7.16 IPSW pieces, ~7.5 GB, and a 16 GB root image built on the Mac without root):
+
+```sh
+IPSW=https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
+for f in DeviceTree.d22ap.im4p 087-86715-047.dmg 087-86593-047.dmg 087-86698-044.dmg; do python3 tools/remotezip.py "$IPSW" $f ipsw; done
+python3 tools/im4p.py ipsw/Firmware/all_flash/DeviceTree.d22ap.im4p ipsw/d22ap.adt     # /product for mkadt.py
+python3 iOS16-on-A40/tools/mkroot.py ipsw/087-86698-044.dmg ipsw/087-86593-047.dmg ipsw/087-86715-047.dmg out/root.img 16
+tools/qemu-ios.sh                # one-time fixer boot, then iOS; screen in out/ios/screen.html
+tools/qemu-key.py out/ios/run    # press the power button (wakes the display after it turns off)
+python3 tools/disk-log.py out/ios/disk.img   # the kernel's persistent log, even while running
+```
+
+The first boot shows the Apple logo after ~10 minutes and the lock screen after ~25 (second boot ~8 minutes). iOS turns the display off when the lock screen is idle; `qemu-key.py` wakes it.
 
 What QEMU cannot test: the Pixel's UFS controller, buttons, Samsung UART, watchdog and real memory map. Those are what the diagnostic boot (`docs/bringup.md` step 1) checks on the phone.
 
