@@ -779,11 +779,43 @@ index 3752157..44a8858 100644
  	__asm__ volatile("dsb sy" ::: "memory");
  	sweet_early_mark(9, "kernel framebuffer VA live");
  }
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..d6985b5 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -283,10 +283,14 @@ _cnputs(char *c, int size, bool poll)
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++#if !defined(SWEET_BOARD_BLUEJAY)
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
+ #endif
++	/* bluejay: the mute only stops the framebuffer console (pe_serial.c
++	 * fbcon_transmit_data); a sweetuart serial console keeps the log. */
++#endif
+ 
+ 	if (disableConsoleOutput) {
+ 		return;
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
-index 9cdaf06..9fa1361 100644
+index 9cdaf06..cf4c03b 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -869,6 +869,87 @@ fbcon_probe(void)
+@@ -775,6 +775,12 @@ fbcon_transmit_ready(void)
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++#if defined(SWEET_BOARD_BLUEJAY)
++	extern int sweet_console_muted;         /* osfmk/console/serial_console.c */
++	if (sweet_console_muted && !panic_active()) {
++		return;                         /* the GUI owns the screen */
++	}
++#endif
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
+@@ -869,6 +875,87 @@ fbcon_probe(void)
  	}
  }
  
@@ -871,7 +903,7 @@ index 9cdaf06..9fa1361 100644
  #if HIBERNATION
  /**
   * Transitions the serial driver into a mode that can be run in the hibernation
-@@ -950,6 +1031,7 @@ serial_init(void)
+@@ -950,6 +1037,7 @@ serial_init(void)
  	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
  
  	fbcon_probe();
