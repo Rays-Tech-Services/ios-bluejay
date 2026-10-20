@@ -25,3 +25,6 @@ factory/
 
 # Kernel logs pulled from the phone or QEMU
 logs/
+
+# Third-party sources for reference (Google kernel trees)
+/research/

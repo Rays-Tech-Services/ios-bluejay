@@ -1,3 +1,15 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index bf085da..2f71133 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a40_blk.c			standard
+ bsd/dev/a40_keys.c			standard
+ bsd/dev/a40_touch.c			standard
++bsd/dev/bluejay_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
 diff --git a/bsd/dev/a40_keys.c b/bsd/dev/a40_keys.c
 index 73ba0e4..040186d 100644
 --- a/bsd/dev/a40_keys.c
@@ -103,6 +115,265 @@ index 73ba0e4..040186d 100644
  	if (SecureDTLookupEntry(NULL, "/a40-keys", &node) != kSuccess ||
  	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
  		return a40_platform();  /* A40 without keys (QEMU): never probe sweet's SPMI */
+diff --git a/bsd/dev/a40_touch.c b/bsd/dev/a40_touch.c
+index c640939..a2c2826 100644
+--- a/bsd/dev/a40_touch.c
++++ b/bsd/dev/a40_touch.c
+@@ -259,6 +259,10 @@ a40_touch_init(void)
+ 	DTEntry node;
+ 	thread_t th;
+ 
++	extern int bluejay_touch_init(void);
++	if (bluejay_touch_init()) {
++		return 1;               /* Pixel 6a: ST FTM5, bsd/dev/bluejay_touch.c */
++	}
+ 	if (SecureDTLookupEntry(NULL, "/a40-touch", &node) != kSuccess) {
+ 		extern int a40_platform(void);
+ 		return a40_platform();
+diff --git a/bsd/dev/bluejay_touch.c b/bsd/dev/bluejay_touch.c
+new file mode 100644
+index 0000000..2191952
+--- /dev/null
++++ b/bsd/dev/bluejay_touch.c
+@@ -0,0 +1,238 @@
++/*
++ * Pixel 6a touchscreen: ST FTM5 ("stm_fts", firmware ftm5_fw_b3, chip id
++ * 0x36 0x48) on spi_11 (Google gs101-common-touch.dtsi / gs101-fts-touch.dtsi,
++ * protocol from Google's fts_touch/ftm5 driver, SPI flavour).
++ *
++ * The SPI bus is bit-banged on its GPIOs (mode 0, ~250 kHz): no USI mode,
++ * clock or divider setup, and a few bytes per event is all touch needs.
++ * ADT node /bluejay-touch (tools/mkadt.py):
++ *   spi    = <u64 PA of the GPIO bank CON register, u32 clk, mosi, miso, cs>
++ *   ctl    = <u64 PA of the reset/select bank, u32 reset pin, u32 select pin>
++ *   size   = <u32 max x, u32 max y> (1079, 2399: panel pixels)
++ * TS_SPI_SEL low gives the bus to the AP (high: the always-on processor).
++ *
++ * Start-up: reset pulse, chip id read (HW reg 0x20000000), interrupt enable,
++ * active scan (A0 00 FF). A kernel thread then reads the event FIFO
++ * (cmd 0x87, one dummy byte, 8-byte events) every 10 ms and reports
++ * enter (0x13) / motion (0x23) / leave (0x33) through sweet_hid_touch().
++ * Disabled with boot-arg sweettouch=0. The chip's supplies (PMIC LDO25M and
++ * LDO26M) are not switched here: if ABL leaves them off the id read fails
++ * and the driver says so.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++int bluejay_touch_init(void);
++
++#define FTS_FINGERS     10
++#define EVT_ENTER       0x13
++#define EVT_MOTION      0x23
++#define EVT_LEAVE       0x33
++#define EVT_READY       0x03
++
++static struct {
++	volatile uint32_t *spi;         /* GPIO bank: CON at +0, DAT at +4 */
++	volatile uint32_t *ctl;
++	uint32_t clk, mosi, miso, cs, reset, sel;
++	int max_x, max_y;
++	bool down[FTS_FINGERS];
++} bt;
++static int bt_chan;
++uint32_t bluejay_touch_diag[4];         /* id bytes, first event: in panics/logs */
++
++static void
++pin_func(volatile uint32_t *bank, uint32_t pin, uint32_t fn)
++{
++	bank[0] = (bank[0] & ~(0xfu << (4 * pin))) | (fn << (4 * pin));
++}
++
++static void
++pin_set(volatile uint32_t *bank, uint32_t pin, int v)
++{
++	uint32_t d = bank[1];
++	bank[1] = v ? (d | (1u << pin)) : (d & ~(1u << pin));
++}
++
++static uint8_t
++spi_byte(uint8_t out)
++{
++	uint8_t in = 0;
++	for (int b = 7; b >= 0; b--) {
++		pin_set(bt.spi, bt.mosi, (out >> b) & 1);
++		delay(2);
++		pin_set(bt.spi, bt.clk, 1);
++		in = (uint8_t)((in << 1) | ((bt.spi[1] >> bt.miso) & 1));
++		delay(2);
++		pin_set(bt.spi, bt.clk, 0);
++	}
++	return in;
++}
++
++static void
++spi_xfer(const uint8_t *tx, int ntx, uint8_t *rx, int nrx)
++{
++	pin_set(bt.spi, bt.cs, 0);
++	delay(2);
++	for (int i = 0; i < ntx; i++) {
++		(void)spi_byte(tx[i]);
++	}
++	for (int i = 0; i < nrx; i++) {
++		rx[i] = spi_byte(0);
++	}
++	delay(2);
++	pin_set(bt.spi, bt.cs, 1);
++	delay(10);                      /* SPI_DELAY_CS */
++}
++
++/* One event from the FIFO; returns its id (0 = FIFO empty). */
++static uint8_t
++fts_event(uint8_t ev[8])
++{
++	static const uint8_t cmd = 0x87;       /* FIFO_CMD_READALL, SPI */
++	uint8_t rx[9];
++	spi_xfer(&cmd, 1, rx, sizeof(rx));
++	memcpy(ev, rx + 1, 8);                  /* skip DUMMY_FIFO */
++	return ev[0];
++}
++
++static void
++fts_report(const uint8_t ev[8])
++{
++	int id = ev[1] >> 4;
++	if (id >= FTS_FINGERS) {
++		return;
++	}
++	int x = ((ev[3] & 0x0f) << 8) | ev[2];
++	int y = (ev[4] << 4) | (ev[3] >> 4);
++	x = x > bt.max_x ? bt.max_x : x;
++	y = y > bt.max_y ? bt.max_y : y;
++	bool down = ev[0] != EVT_LEAVE;
++	if (down != bt.down[id] && id == 0) {
++		printf("BLUEJAY TOUCH: finger %d %s at %d,%d\n", id, down ? "down" : "up", x, y);
++	}
++	bt.down[id] = down;
++	sweet_hid_touch(id, down, x, y);
++}
++
++static void
++bluejay_touch_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		uint8_t ev[8];
++		for (int n = 0; n < 32; n++) {         /* FIFO_DEPTH */
++			uint8_t id = fts_event(ev);
++			if (id == 0x00 || id == 0xff) {
++				break;
++			}
++			if (id == EVT_ENTER || id == EVT_MOTION || id == EVT_LEAVE) {
++				fts_report(ev);
++			}
++		}
++		assert_wait_timeout((event_t)&bt_chan, THREAD_UNINT, 10, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++static void
++sleep_ms(uint32_t ms)
++{
++	assert_wait_timeout((event_t)&bt_chan, THREAD_UNINT, ms, NSEC_PER_MSEC);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++bluejay_touch_start(__unused void *arg, __unused wait_result_t wr)
++{
++	/* Bus to the AP, pins as GPIOs, CS idle high, clock idle low. */
++	pin_func(bt.ctl, bt.sel, 1);
++	pin_set(bt.ctl, bt.sel, 0);
++	pin_set(bt.spi, bt.cs, 1);
++	pin_set(bt.spi, bt.clk, 0);
++	pin_func(bt.spi, bt.clk, 1);
++	pin_func(bt.spi, bt.mosi, 1);
++	pin_func(bt.spi, bt.miso, 0);
++	pin_func(bt.spi, bt.cs, 1);
++	pin_func(bt.ctl, bt.reset, 1);
++	pin_set(bt.ctl, bt.reset, 0);
++	sleep_ms(10);
++	pin_set(bt.ctl, bt.reset, 1);
++
++	uint8_t ev[8] = { 0 };
++	for (int i = 0; i < 50 && fts_event(ev) != EVT_READY; i++) {
++		sleep_ms(10);
++	}
++	bluejay_touch_diag[1] = ev[0];
++
++	static const uint8_t rd_id[5] = { 0xfb, 0x20, 0x00, 0x00, 0x00 };      /* HW reg 0x20000000 */
++	uint8_t id[5];
++	spi_xfer(rd_id, sizeof(rd_id), id, sizeof(id));
++	bluejay_touch_diag[0] = (uint32_t)id[1] << 24 | (uint32_t)id[2] << 16 | (uint32_t)id[3] << 8 | id[4];
++	printf("BLUEJAY TOUCH: ready event 0x%02x, chip id %02x %02x, fw %02x %02x\n",
++	    ev[0], id[1], id[2], id[3], id[4]);
++	if (id[1] != 0x36 || id[2] != 0x48) {
++		printf("BLUEJAY TOUCH: no FTM5 on the bus (touch supplies LDO25M/LDO26M off?); touch disabled\n");
++		return;
++	}
++	static const uint8_t ier[6] = { 0xfa, 0x20, 0x00, 0x00, 0x29, 0x41 };   /* ADDR_IER = IER_ENABLE */
++	static const uint8_t pre[7] = { 0xfa, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00 };
++	static const uint8_t scan[3] = { 0xa0, 0x00, 0xff };                   /* SCAN_MODE_ACTIVE, all */
++	spi_xfer(ier, sizeof(ier), NULL, 0);
++	spi_xfer(pre, sizeof(pre), NULL, 0);
++	spi_xfer(scan, sizeof(scan), NULL, 0);
++	printf("BLUEJAY TOUCH: scanning, %dx%d\n", bt.max_x + 1, bt.max_y + 1);
++	bluejay_touch_thread(NULL, THREAD_AWAKENED);
++}
++
++/* Returns 1 when the ADT describes this touchscreen (whether or not it answers). */
++int
++bluejay_touch_init(void)
++{
++	DTEntry node;
++	uint8_t const *spi, *ctl;
++	uint32_t const *size;
++	unsigned int ssz, csz, zsz;
++	thread_t th;
++	int enabled = 1;
++
++	if (SecureDTLookupEntry(NULL, "/bluejay-touch", &node) != kSuccess) {
++		return 0;
++	}
++	PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
++	if (!enabled ||
++	    SecureDTGetProperty(node, "spi", (void const **)&spi, &ssz) != kSuccess || ssz < 24 ||
++	    SecureDTGetProperty(node, "ctl", (void const **)&ctl, &csz) != kSuccess || csz < 16 ||
++	    SecureDTGetProperty(node, "size", (void const **)&size, &zsz) != kSuccess || zsz < 8) {
++		printf("BLUEJAY TOUCH: disabled\n");
++		return 1;
++	}
++	uint64_t spa, cpa;
++	uint32_t pins[4], cpins[2];
++	memcpy(&spa, spi, 8);
++	memcpy(pins, spi + 8, 16);
++	memcpy(&cpa, ctl, 8);
++	memcpy(cpins, ctl + 8, 8);
++	bt.spi = (volatile uint32_t *)(ml_io_map(spa & ~0x3fffULL, 0x4000) + (spa & 0x3fff));
++	bt.ctl = (volatile uint32_t *)(ml_io_map(cpa & ~0x3fffULL, 0x4000) + (cpa & 0x3fff));
++	bt.clk = pins[0];
++	bt.mosi = pins[1];
++	bt.miso = pins[2];
++	bt.cs = pins[3];
++	bt.reset = cpins[0];
++	bt.sel = cpins[1];
++	bt.max_x = (int)size[0];
++	bt.max_y = (int)size[1];
++	printf("BLUEJAY TOUCH: spi bank %#llx con %#x dat %#x, ctl bank %#llx con %#x dat %#x\n",
++	    spa, bt.spi[0], bt.spi[1], cpa, bt.ctl[0], bt.ctl[1]);
++	if (kernel_thread_start(bluejay_touch_start, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	return 1;
++}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
 index 53e5095..e9160f0 100644
 --- a/bsd/dev/sweet_ufs.c

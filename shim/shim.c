@@ -746,6 +746,118 @@ static void diag_ufs(u64 dtb)
 	say(C_DIM, "  no Exynos UFS node");
 }
 
+/* ---- touch probe (ST FTM5, bit-banged SPI mode 0, see board.h) ---- */
+
+static void gpio_func(u64 bank, int pin, u32 fn)
+{
+	u32 con = rd32(bank);
+	wr32(bank, (con & ~(0xfu << (4 * pin))) | (fn << (4 * pin)));
+}
+
+static void gpio_set(u64 bank, int pin, int v)
+{
+	u32 d = rd32(bank + 4);
+	wr32(bank + 4, v ? d | (1u << pin) : d & ~(1u << pin));
+}
+
+static void spi_delay(void)
+{
+	u64 t0 = now();
+	while (now() - t0 < timer_hz / 1000000 + 1)	/* ~1 us: < 500 kHz */
+		;
+}
+
+static u8 spi_byte(u8 out)
+{
+	u8 in = 0;
+	for (int b = 7; b >= 0; b--) {
+		gpio_set(TS_GPP23, 1, (out >> b) & 1);
+		spi_delay();
+		gpio_set(TS_GPP23, 0, 1);
+		in = (u8)(in << 1 | ((rd32(TS_GPP23 + 4) >> 2) & 1));
+		spi_delay();
+		gpio_set(TS_GPP23, 0, 0);
+	}
+	return in;
+}
+
+/* CS low, tx[ntx] out, then nrx bytes in (with 0x00 out), CS high */
+static void spi_xfer(const u8 *tx, int ntx, u8 *rx, int nrx)
+{
+	gpio_set(TS_GPP23, 3, 0);
+	spi_delay();
+	for (int i = 0; i < ntx; i++)
+		spi_byte(tx[i]);
+	for (int i = 0; i < nrx; i++)
+		rx[i] = spi_byte(0);
+	spi_delay();
+	gpio_set(TS_GPP23, 3, 1);
+	delay_ms(1);
+}
+
+static void ts_pins(void)
+{
+	gpio_func(TS_GPP26, 1, 1);		/* TS_SPI_SEL: output, low = AP */
+	gpio_set(TS_GPP26, 1, 0);
+	gpio_set(TS_GPP23, 3, 1);		/* CS high before it becomes an output */
+	gpio_set(TS_GPP23, 0, 0);
+	gpio_func(TS_GPP23, 0, 1);		/* CLK out */
+	gpio_func(TS_GPP23, 1, 1);		/* MOSI out */
+	gpio_func(TS_GPP23, 2, 0);		/* MISO in */
+	gpio_func(TS_GPP23, 3, 1);		/* CS out */
+	gpio_func(TS_GPP26, 0, 1);		/* TS_RESET_L out */
+}
+
+/* one 8-byte event from the FIFO (cmd 0x87, one dummy byte) */
+static void ts_event(u8 *ev)
+{
+	u8 cmd = 0x87, rx[9];
+	spi_xfer(&cmd, 1, rx, 9);
+	for (int i = 0; i < 8; i++)
+		ev[i] = rx[i + 1];
+}
+
+static void ts_show(const char *label, const u8 *b, int n)
+{
+	puts_(label);
+	for (int i = 0; i < n; i++) {
+		putch(' ');
+		putch("0123456789abcdef"[b[i] >> 4]);
+		putch("0123456789abcdef"[b[i] & 15]);
+	}
+	newline();
+}
+
+/* Returns 1 if the chip answered with the FTM5 id. */
+static int ts_probe(void)
+{
+	kv2("  GPP23 con ", rd32(TS_GPP23), " dat ", rd32(TS_GPP23 + 4));
+	kv2("  GPP26 con ", rd32(TS_GPP26), " dat ", rd32(TS_GPP26 + 4));
+	kv("  GPA9 dat (int, low = event) ", rd32(TS_GPA9_DAT));
+	ts_pins();
+	gpio_set(TS_GPP26, 0, 0);		/* reset pulse */
+	delay_ms(10);
+	gpio_set(TS_GPP26, 0, 1);
+	delay_ms(200);
+	u8 ev[8];
+	ts_event(ev);
+	ts_show("  first event (03 = ready):", ev, 8);
+	static const u8 rd_id[5] = { 0xfb, 0x20, 0x00, 0x00, 0x00 };	/* HW reg 0x20000000 */
+	u8 id[7];
+	spi_xfer(rd_id, 5, id, 7);
+	ts_show("  chip id (dummy, 36 48 ...):", id, 7);
+	if (id[1] != 0x36 || id[2] != 0x48) {
+		say(C_ERR, "  no FTM5 answer: touch power (LDO25M/26M) off?");
+		return 0;
+	}
+	static const u8 pre[7] = { 0xfa, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	static const u8 scan[3] = { 0xa0, 0x00, 0xff };	/* active scan, all sensing */
+	spi_xfer(pre, 7, 0, 0);
+	spi_xfer(scan, 3, 0, 0);
+	say(C_OK, "  FTM5 answers; scanning on: touch the screen");
+	return 1;
+}
+
 static void __attribute__((noreturn)) diag(u64 dtb)
 {
 	u64 v;
@@ -767,8 +879,11 @@ static void __attribute__((noreturn)) diag(u64 dtb)
 	watchdogs_off(dtb, 1);
 	say(C_DIM, "UFS (ABL must leave the link up):");
 	diag_ufs(dtb);
+	say(C_DIM, "touch (ST FTM5 on spi_11, bit-banged):");
+	int touch_ok = ts_probe();
 	say(C_DIM, "keys (DAT registers, press the buttons):");
 	int keys_row = row, kind = uart_kind;
+	u8 last_touch[8] = { 0 };
 	u32 last[3] = { 1, 1, 1 };
 	for (u64 n = 0;; n++) {
 		row = keys_row;
@@ -793,6 +908,17 @@ static void __attribute__((noreturn)) diag(u64 dtb)
 			else
 				puts_("  DOWN");
 			newline();
+		}
+		if (touch_ok) {
+			u8 ev[8];
+			ts_event(ev);
+			/* 13 enter, 23 motion, 33 leave: x = 12 bits of b2/b3, y = b4/b3 */
+			if (ev[0] == 0x13 || ev[0] == 0x23 || ev[0] == 0x33)
+				for (int i = 0; i < 8; i++)
+					last_touch[i] = ev[i];
+			ts_show("  touch event:", last_touch, 8);
+			kv2("  touch x ", (u32)((last_touch[3] & 0x0f) << 8 | last_touch[2]),
+			    " y ", (u32)(last_touch[4] << 4 | last_touch[3] >> 4));
 		}
 		puts_("  alive ");
 		puthex(n, 8);

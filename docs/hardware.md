@@ -49,7 +49,11 @@ Nothing in this file has been tested on a real Pixel 6a yet.
 
 * Buttons are plain GPIOs (mainline oriole `gpio-keys`), active low:
   power `gpa10-1` (ALIVE `0x174d0000`, bank +0xe0), volume up `gpa8-1` and volume down `gpa7-3` (FAR_ALIVE `0x174e0000`, banks +0x40 / +0x20). DAT = bank + 4. **VERIFY on bluejay** (diagnostic boot shows them live)
-* Touch: a Goodix controller on SPI on the 6a (sweet has a Goodix GT9896 over I²C, same Berlin protocol family). **Not ported yet**: needs the SPI (USI) transport, the power rails and the attention GPIO measured first.
+* Touch: **ST FTM5** (`stm_fts`, firmware `ftm5_fw_b3`, chip id `36 48`), not Goodix. Source: Google's `kernel/devices/google/bluejay` (`gs101-bluejay-touch.dtsi`, included by the retail `mp1_0` tree) and `gs101-common-touch.dtsi`. **Known**
+  * On `spi_11` (`0x10D40000`), pins CLK/MOSI/MISO/CS = GPP23[0..3]; reset = GPP26[0]; bus select TS_SPI_SEL = GPP26[1] (low: AP, high: the always-on processor); interrupt = GPA9[0], active low. GPP23/GPP26 are banks +0x60/+0xC0 of the peric1 pin controller at `0x10C40000` (mainline `gs101_pin_peric1`).
+  * Supplies: DVDD = PMIC LDO25M (1.8 V), AVDD = LDO26M (3.3 V), switched over ACPM. **VERIFY** whether ABL leaves them on: the diagnostic boot reads the chip id.
+  * Protocol (Google `fts_touch/ftm5`, SPI flavour): register read `FB <4-byte address>` + one dummy byte; write `FA <address> <data>`; FIFO read `87` + dummy + 8-byte events (`13` down, `23` move, `33` up; x = 12 bits of bytes 2–3, y = bytes 3–4, 1079 × 2399); active scan `A0 00 FF`.
+  * The kernel driver (`bsd/dev/bluejay_touch.c`) and the shim bit-bang SPI mode 0 on those GPIOs, so neither needs the USI/clock setup of the SPI controller.
 
 ## Debug output
 

@@ -33,3 +33,17 @@ static inline int key_bit(int k)
 {
 	return k == 0 ? 1 : k == 1 ? 1 : 3;
 }
+
+/*
+ * Touch: ST FTM5 (driver "stm_fts", fw ftm5_fw_b3) on spi_11, from Google's
+ * gs101-common-touch.dtsi / gs101-fts-touch.dtsi; bank offsets from mainline
+ * pinctrl-exynos-arm64.c (gs101_pin_peric1 / gs101_pin_alive).
+ *   CLK=GPP23[0] MOSI=GPP23[1] MISO=GPP23[2] CS=GPP23[3]
+ *   TS_RESET_L=GPP26[0]  TS_SPI_SEL=GPP26[1] (low: AP owns the bus, high: AOC)
+ *   TS_INT_L=GPA9[0]
+ * The shim and the kernel bit-bang the bus on these GPIOs (no USI/clock setup).
+ */
+#define PERIC1_PINCTRL		0x10C40000UL
+#define TS_GPP23		(PERIC1_PINCTRL + 0x60)	/* CON +0, DAT +4, PUD +8 */
+#define TS_GPP26		(PERIC1_PINCTRL + 0xc0)
+#define TS_GPA9_DAT		(0x174d0000UL + 0xc0 + 4)

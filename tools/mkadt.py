@@ -56,10 +56,11 @@ FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 FB_SIZE = 0xA00000
 
 # gpio-keys, active low. Banks from mainline pinctrl-exynos-arm64.c
-# (gs101_pin_alive / gs101_pin_far_alive, DAT = bank + 4), pins from
+# (gs101_pin_alive / gs101_pin_far_alive, DAT = bank + 4, checked), pins from
 # gs101-oriole.dts. VERIFY on bluejay: the shim's diagnostic boot shows the
 # three DAT registers live while you press the buttons.
 ALIVE, FAR_ALIVE = 0x174d0000, 0x174e0000
+PERIC1_PINCTRL = 0x10c40000                   # gpp20-gpp27 (touch SPI, reset, select)
 KEY_POWER, KEY_VOLUP, KEY_VOLDOWN = 0, 1, 2  # sweet_hid_key() indices
 KEYS = [
     (ALIVE + 0xe0 + 4, 1, KEY_POWER),        # gpa10-1
@@ -236,6 +237,17 @@ def build(seed=None, qemu=False):
         ('keys', b''.join(struct.pack('<QII', pa, bit, key) for pa, bit, key in KEYS)),
     ])]
 
+    # bsd/dev/bluejay_touch.c: ST FTM5 on spi_11, bit-banged on its GPIOs
+    # (Google gs101-common-touch.dtsi; bank offsets from mainline pinctrl).
+    # spi = <GPP23 bank, clk, mosi, miso, cs>, ctl = <GPP26 bank, reset, select>
+    touch = [] if qemu else [node('bluejay-touch', [
+        ph(),
+        ('compatible', cstr('st,fts')),
+        ('spi', struct.pack('<Q4I', PERIC1_PINCTRL + 0x60, 0, 1, 2, 3)),
+        ('ctl', struct.pack('<Q2I', PERIC1_PINCTRL + 0xc0, 0, 1)),
+        ('size', u32(FB_W - 1, FB_H - 1)),
+    ])]
+
     defaults = node('defaults', [ph(), ('no-effaceable-storage', u32(1))])
     buttons = node('buttons', [
         ph(),
@@ -261,7 +273,7 @@ def build(seed=None, qemu=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, board, uart] + product + [storage] + keys)
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, board, uart] + product + [storage] + keys + touch)
 
 
 if __name__ == '__main__':
