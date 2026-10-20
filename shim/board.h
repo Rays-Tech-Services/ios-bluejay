@@ -58,3 +58,20 @@ static inline int key_bit(int k)
 #define DECON_GLOBAL_CON	0x20		/* bit 8: command mode, bits 0/1: enable */
 #define DECON_TRIG_CON		0x30		/* bit 0 HW_TRIG_EN, 4 HW_TRIG_MASK_DECON, 8 SW_TRIG_EN */
 #define DECON_SHD_REG_UP_REQ	0x50		/* bit 31: global shadow update */
+
+/*
+ * Touch supplies on the main PMIC (S2MPG10), reached through the APM's ACPM
+ * firmware (mainline drivers/firmware/samsung/exynos-acpm*.c, sec-acpm.c):
+ * channel table in APM SRAM at 0x2039000 + 0xa000, PMIC requests on ACPM
+ * channel 2 / speedy channel 0, doorbell = AP2APM mailbox INTGR1 bit 2.
+ * L25M_CTRL 0x5c "L25M_TSP_DVDD": 0.7 V + 25 mV * sel[5:0], rail 1.6-1.95 V
+ * L26M_CTRL 0x5d "L26M_TS_AVDD":  1.8 V + 25 mV * sel[5:0], rail 2.5-3.3 V
+ * bit 7 = enable (Google gs101-pmic.dtsi names, mainline s2mps11.c ranges).
+ */
+#define APM_SRAM		0x02039000UL
+#define ACPM_INITDATA		0xa000
+#define AP2APM_MBOX		0x17610000UL
+#define MBOX_INTGR1		0x40
+#define ACPM_PMIC_CHAN		2
+#define S2MPG10_L25M_CTRL	0x5c
+#define S2MPG10_L26M_CTRL	0x5d

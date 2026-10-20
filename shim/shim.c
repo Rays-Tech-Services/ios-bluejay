@@ -805,6 +805,107 @@ static void diag_ufs(u64 dtb)
 	say(C_DIM, "  no Exynos UFS node");
 }
 
+/* ---- ACPM: PMIC register access through the APM firmware (board.h) ---- */
+
+static u8 acpm_seq;
+
+/*
+ * One PMIC request on ACPM channel 2: func 0 = read, 2 = update(value, mask).
+ * Returns 0 and the register value in *out, or a negative code.
+ */
+static int acpm_pmic(u8 reg, u8 func, u8 value, u8 mask, u8 *out)
+{
+	u64 shmem = APM_SRAM + ACPM_INITDATA;
+	if (rd32(shmem + 24) <= ACPM_PMIC_CHAN)		/* num_chans */
+		return -1;
+	u64 ch = APM_SRAM + rd32(shmem + 8) + ACPM_PMIC_CHAN * 72;	/* acpm_chan_shmem */
+	u32 qlen = rd32(ch + 52), mlen = rd32(ch + 56);
+	if (!qlen || qlen > 64 || mlen < 16 || mlen > 256)
+		return -2;
+	/* the AP sends on the firmware's rx queue and receives on its tx queue */
+	u64 tx_rear = APM_SRAM + rd32(ch + 16), tx_front = APM_SRAM + rd32(ch + 20), tx_base = APM_SRAM + rd32(ch + 24);
+	u64 rx_rear = APM_SRAM + rd32(ch + 40), rx_front = APM_SRAM + rd32(ch + 44), rx_base = APM_SRAM + rd32(ch + 48);
+
+	u32 front = rd32(tx_front), next = (front + 1) % qlen;
+	for (int i = 0; rd32(tx_rear) == next; i++) {
+		if (i > 1000)
+			return -3;			/* queue full */
+		delay_ms(1);
+	}
+	acpm_seq = acpm_seq % 63 + 1;
+	u32 cmd[4];
+	cmd[0] = (u32)acpm_seq << 16 | (0u << 12) | (1u << 8) | reg;	/* speedy 0, type PMIC */
+	cmd[1] = (u32)mask << 16 | (u32)value << 8 | func;
+	cmd[2] = 0;
+	cmd[3] = (u32)(now() / (timer_hz / 1000));
+	for (int i = 0; i < 4; i++)
+		wr32(tx_base + mlen * front + 4 * i, cmd[i]);
+	wr32(tx_front, next);
+	wr32(AP2APM_MBOX + MBOX_INTGR1, 1u << ACPM_PMIC_CHAN);
+
+	for (int t = 0; t < 2000; t++) {		/* ~100 ms */
+		u32 i = rd32(rx_rear), f = rd32(rx_front);
+		int got = 0;
+		u32 w1 = 0;
+		while (i != f) {
+			u64 m = rx_base + mlen * i;
+			if (((rd32(m) >> 16) & 0x3f) == acpm_seq) {
+				got = 1;
+				w1 = rd32(m + 4);
+			}
+			i = (i + 1) % qlen;
+		}
+		wr32(rx_rear, f);
+		if (got) {
+			if (out)
+				*out = (u8)(w1 >> 8);
+			return (w1 >> 24) ? -(int)(w1 >> 24) - 10 : 0;
+		}
+		u64 t0 = now();
+		while (now() - t0 < timer_hz / 20000)	/* 50 us */
+			;
+	}
+	return -4;					/* no answer */
+}
+
+/* Switch on the touch supplies, keeping a firmware voltage when in the rail's range. */
+static int touch_power(int verbose)
+{
+	static const u8 regs[2] = { S2MPG10_L25M_CTRL, S2MPG10_L26M_CTRL };
+	static const u32 base_mv[2] = { 700, 1800 }, min_mv[2] = { 1600, 2500 },
+	    max_mv[2] = { 1950, 3300 }, want_mv[2] = { 1800, 3300 };
+	for (int i = 0; i < 2; i++) {
+		u8 v = 0, after = 0;
+		int e = acpm_pmic(regs[i], 0, 0, 0, &v);
+		if (e) {
+			kv2("  ACPM read error ", (u32)-e, " reg ", regs[i]);
+			return 0;
+		}
+		u32 mv = base_mv[i] + 25 * (v & 0x3f);
+		u8 sel = v & 0x3f;
+		if (mv < min_mv[i] || mv > max_mv[i])
+			sel = (u8)((want_mv[i] - base_mv[i]) / 25);
+		e = acpm_pmic(regs[i], 2, (u8)(0x80 | sel), 0xbf, 0);
+		if (!e)
+			e = acpm_pmic(regs[i], 0, 0, 0, &after);
+		if (verbose || e) {
+			puts_(i ? "  L26M (TS_AVDD)  " : "  L25M (TSP_DVDD) ");
+			puthex(v, 2);
+			puts_(" -> ");
+			puthex(after, 2);
+			puts_(" = ");
+			puthex(base_mv[i] + 25 * (after & 0x3f), 4);
+			puts_(" mV");
+			newline();
+		}
+		if (e) {
+			kv("  ACPM update error ", (u32)-e);
+			return 0;
+		}
+	}
+	return 1;
+}
+
 /* ---- touch probe (ST FTM5, bit-banged SPI mode 0, see board.h) ---- */
 
 static void gpio_func(u64 bank, int pin, u32 fn)
@@ -939,6 +1040,11 @@ static void __attribute__((noreturn)) diag(u64 dtb)
 	watchdogs_off(dtb, 1);
 	say(C_DIM, "UFS (ABL must leave the link up):");
 	diag_ufs(dtb);
+	say(C_DIM, "touch power (PMIC LDO25M/26M via ACPM):");
+	if (!fdt_has_decon(dtb))
+		say(C_DIM, "  not a GS101 (no DECON in the tree): skipped");
+	else if (touch_power(1))
+		delay_ms(20);
 	say(C_DIM, "touch (ST FTM5 on spi_11, bit-banged):");
 	int touch_ok = ts_probe();
 	say(C_DIM, "keys (DAT registers, press the buttons):");
@@ -1067,6 +1173,9 @@ __attribute__((used)) void shim_main(u64 dtb, u64 base, u64 entry_el)
 	}
 	if (!payload_flag(p, "shimwdt=0"))
 		watchdogs_off(dtb, 0);
+	/* Touch supplies on before XNU (bsd/dev/bluejay_touch.c resets the chip). */
+	if (fdt_has_decon(dtb) && !payload_flag(p, "shimtouchpwr=0"))
+		touch_power(1);
 
 	u64 pa_of_va = p->phys_base - p->virt_base;
 	kv2("XNU RAM ", p->phys_base, " size ", p->mem_size);
