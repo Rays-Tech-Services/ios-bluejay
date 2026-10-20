@@ -1018,6 +1018,137 @@ static int ts_probe(void)
 	return 1;
 }
 
+/* ---- UFS command test (read-only), to find how XNU should take the host over ---- */
+
+#define UFS_IS		0x20
+#define UFS_HCS		0x30
+#define UFS_UTRLBA	0x50
+#define UFS_UTRLBAU	0x54
+#define UFS_DBR		0x58
+#define UFS_RSR		0x60
+
+/* UCD (cmd UPIU, response UPIU, PRDT) and a 4 KiB data buffer, in the shim image */
+__asm__(".text\n.balign 4096\nufs_ucd_buf:\n.zero 8192\nufs_data_buf:\n.zero 4096\nufs_list_buf:\n.zero 4096\n");
+
+static u64 sym_addr_ucd(void) { u64 a; __asm__("adr %0, ufs_ucd_buf" : "=r"(a)); return a; }
+static u64 sym_addr_data(void) { u64 a; __asm__("adr %0, ufs_data_buf" : "=r"(a)); return a; }
+static u64 sym_addr_list(void) { u64 a; __asm__("adr %0, ufs_list_buf" : "=r"(a)); return a; }
+
+static void zero32(u64 a, u32 n)
+{
+	for (u32 i = 0; i < n; i += 4)
+		wr32(a + i, 0);
+}
+
+static u8 ufs_tag;
+
+/*
+ * One SCSI command in UTRD slot `slot` of the list at `list`, Exynos format
+ * (byte offsets, 16-byte PRDT entries, 4 KiB segments). Returns OCS (0 = ok),
+ * 0x100 + response status, or 0x200 on timeout. MMU off: no cache maintenance.
+ */
+static u32 ufs_cmd(u64 hci, u64 list, int slot, u8 lun, const u8 *cdb, int cdb_len, u64 data, u32 len)
+{
+	u64 ucd = sym_addr_ucd(), utrd = list + 32 * slot;
+	zero32(ucd, 1024 + 16);
+	zero32(utrd, 32);
+	wr32(ucd + 0, (u32)0x01 | (len ? 0x40u : 0) << 8 | (u32)lun << 16 | (u32)(++ufs_tag) << 24);
+	wr32(ucd + 12, __builtin_bswap32(len));
+	u32 c[4] = { 0, 0, 0, 0 };
+	for (int i = 0; i < cdb_len; i++)
+		c[i / 4] |= (u32)cdb[i] << (8 * (i % 4));
+	for (int i = 0; i < 4; i++)
+		wr32(ucd + 16 + 4 * i, c[i]);
+	if (len) {
+		wr32(ucd + 1024 + 0, (u32)data);
+		wr32(ucd + 1024 + 4, (u32)(data >> 32));
+		wr32(ucd + 1024 + 12, len - 1);
+	}
+	wr32(utrd + 0, (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24));
+	wr32(utrd + 8, 0x0f);
+	wr32(utrd + 16, (u32)ucd);
+	wr32(utrd + 20, (u32)(ucd >> 32));
+	wr32(utrd + 24, 512u << 16 | 512u);
+	wr32(utrd + 28, 1024u << 16 | (len ? 16u : 0u));
+	__asm__ volatile("dsb sy" ::: "memory");
+	wr32(hci + UFS_DBR, 1u << slot);
+	u64 t0 = now();
+	while (rd32(hci + UFS_DBR) & (1u << slot))
+		if (now() - t0 > timer_hz)			/* 1 s */
+			return 0x200;
+	wr32(hci + UFS_IS, rd32(hci + UFS_IS));
+	u32 ocs = rd32(utrd + 8) & 0xff;
+	if (ocs)
+		return ocs;
+	u32 r0 = rd32(ucd + 512);
+	if ((r0 & 0xff) != 0x21)			/* RESPONSE UPIU */
+		return 0x300 | (r0 & 0xff);
+	u32 r1 = rd32(ucd + 512 + 4);			/* response, status in bytes 6/7 */
+	return (r1 >> 16) & 0xffff ? 0x100 | ((r1 >> 24) & 0xff) : 0;
+}
+
+static void ufs_try(const char *label, u64 hci, u64 list, int slot, u64 data)
+{
+	static const u8 tur[6] = { 0 };
+	static const u8 rd10[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0 };	/* READ(10) LBA 1, 1 block */
+	u32 e = 0;
+	for (int i = 0; i < 3 && (e = ufs_cmd(hci, list, slot, 0, tur, 6, 0, 0)); i++)
+		;
+	puts_(label);
+	puts_(" TUR ");
+	puthex(e, 3);
+	if (e == 0) {
+		zero32(data, 16);
+		e = ufs_cmd(hci, list, slot, 0, rd10, 10, data, 4096);
+		puts_(" READ ");
+		puthex(e, 3);
+		u32 a = rd32(data), b = rd32(data + 4);
+		puts_(a == 0x20494645 && b == 0x54524150 ? "  EFI PART: OK" : "  no GPT");
+	}
+	newline();
+	kv2("     IS ", rd32(hci + UFS_IS), " DBR ", rd32(hci + UFS_DBR));
+}
+
+static void diag_ufs_test(u64 dtb)
+{
+	struct fdt f;
+	u64 hci = 0, hs, vs = 0, vss;
+	fdt_begin(&f, dtb);
+	while (fdt_next(&f))
+		if (prop_is(&f, "compatible") && contains((const char *)f.val, f.len, "ufs") &&
+		    (contains((const char *)f.val, f.len, "exynos") || contains((const char *)f.val, f.len, "gs101")) &&
+		    node_reg(&f, 0, &hci, &hs)) {
+			node_reg(&f, 1, &vs, &vss);
+			break;
+		}
+	if (!hci) {
+		say(C_DIM, "  no Exynos UFS node: skipped");
+		return;
+	}
+	u64 abl_list = rd32(hci + UFS_UTRLBA) | (u64)rd32(hci + UFS_UTRLBAU) << 32;
+	kv2("  RSR ", rd32(hci + UFS_RSR), " list ", abl_list);
+	/* 1. ABL's list, slot 1 (its nexus bit is set), data in the shim (low DRAM) */
+	ufs_try("  A abl list s1 low", hci, abl_list, 1, sym_addr_data());
+	/* 2. same, data buffer in XNU's RAM (high bank, 36-bit DMA) */
+	ufs_try("  B abl list s1 high", hci, abl_list, 1, 0x880000000UL);
+	/* 3. slot 0 after setting its nexus bit (what the kernel does) */
+	if (vs) {
+		wr32(vs + 0x40, rd32(vs + 0x40) | 1);
+		ufs_try("  C abl list s0 low", hci, abl_list, 0, sym_addr_data());
+	}
+	/* 4. our own list in low DRAM: base rewritten while RSR = 1 (the kernel's way) */
+	u64 own = sym_addr_list();
+	wr32(hci + UFS_RSR, 0);
+	wr32(hci + UFS_UTRLBA, (u32)own);
+	wr32(hci + UFS_UTRLBAU, (u32)(own >> 32));
+	wr32(hci + UFS_RSR, 1);
+	kv2("  own list ", own, " RSR ", rd32(hci + UFS_RSR));
+	ufs_try("  D own list s1 low", hci, own, 1, sym_addr_data());
+	/* put ABL's list back */
+	wr32(hci + UFS_UTRLBA, (u32)abl_list);
+	wr32(hci + UFS_UTRLBAU, (u32)(abl_list >> 32));
+}
+
 static void __attribute__((noreturn)) diag(u64 dtb)
 {
 	u64 v;
@@ -1040,6 +1171,8 @@ static void __attribute__((noreturn)) diag(u64 dtb)
 	watchdogs_off(dtb, 1);
 	say(C_DIM, "UFS (ABL must leave the link up):");
 	diag_ufs(dtb);
+	say(C_DIM, "UFS command test (read-only):");
+	diag_ufs_test(dtb);
 	say(C_DIM, "touch power (PMIC LDO25M/26M via ACPM):");
 	if (!fdt_has_decon(dtb))
 		say(C_DIM, "  not a GS101 (no DECON in the tree): skipped");
