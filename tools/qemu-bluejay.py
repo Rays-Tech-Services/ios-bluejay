@@ -256,6 +256,7 @@ def main():
     ap.add_argument('image', nargs='?')
     ap.add_argument('outdir', nargs='?')
     ap.add_argument('--secs', type=float, default=30, help='run time; 0 = until Ctrl-C')
+    ap.add_argument('--until', help='stop as soon as serial.txt matches this regex')
     ap.add_argument('--live', action='store_true', help='stream serial.txt (shim + kernel log) to this terminal')
     ap.add_argument('--disk', help='raw root disk (GPT with a "userdata" partition) as virtio-blk')
     ap.add_argument('--snapshot', action='store_true', help='do not write to --disk')
@@ -354,16 +355,24 @@ def main():
             return 0
         t0 = last = time.time()
         pos = 0
+        tail = ''
+        until = re.compile(a.until) if a.until else None
         try:
             while p.poll() is None and (a.secs <= 0 or time.time() - t0 < a.secs):
                 time.sleep(0.25)
-                if a.live and os.path.exists(f'{out}/serial.txt'):
+                if (a.live or until) and os.path.exists(f'{out}/serial.txt'):
                     with open(f'{out}/serial.txt', 'rb') as sf:
                         sf.seek(pos)
-                        chunk = sf.read()
-                    pos += len(chunk)
-                    sys.stdout.write(chunk.decode(errors='replace'))
-                    sys.stdout.flush()
+                        raw_chunk = sf.read()
+                    pos += len(raw_chunk)
+                    chunk = raw_chunk.decode(errors='replace')
+                    if a.live:
+                        sys.stdout.write(chunk)
+                        sys.stdout.flush()
+                    tail = (tail + chunk)[-4096:]
+                    if until and until.search(tail):
+                        print(f'\n--until matched after {time.time() - t0:.0f} s', file=sys.stderr)
+                        break
                 if a.watch and time.time() - last >= a.watch and os.path.exists(mon):
                     last = time.time()
                     qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
