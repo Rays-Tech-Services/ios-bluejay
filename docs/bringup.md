@@ -1,6 +1,11 @@
 # Bringing it up on a real Pixel 6a
 
-None of this has run on a Pixel 6a yet. The steps are ordered so that each one checks an assumption from [hardware.md](hardware.md) before anything depends on it, and so that nothing is written to the phone until step 5. Steps 1 to 4 use only `fastboot boot`, which loads an image into RAM and changes nothing on the phone.
+Real-phone status (2026-10-20): XNU has reached storage probing; the shim has verified display refresh, touch identification and finger coordinates, and a completed GPT header read. The successful storage sequence ungates clocks, exits Hibern8, clears device unit attention with REQUEST SENSE on device WLUN 0xd0, then sends START STOP UNIT with ACTIVE power condition (0x10). Each command uses task tag = slot and acknowledges old interrupt status before ringing the doorbell. This changes device power state but writes no logical blocks. The normal shim now performs the wake sequence before XNU. Kernel takeover of its own list and high-memory DMA still need hardware verification.
+
+IMG_5906.HEIC: DEVICE ACTIVE 0; LUN 0 TUR 0; READ LBA1 0; words 0x20494645 / 0x54524150; DBR 0; OCS 0; response 0x01000021; response/status 0. This is a completed read, unlike IMG_5905's timed-out read with partial data. ABL interrupt aggregation was already 0, so disabling aggregation alone does not explain the change.
+
+Steps 1 to 4 do not flash the phone. Installing the iOS root in step 5 erases Android userdata and requires explicit authorization before execution.
+
 
 ## 0. Before you start
 
@@ -84,6 +89,6 @@ First boot = fixer boot: append `launchdsuffix=a40fix` to the command line in st
 
 ## Known gaps
 
-* **Touch** is written (ST FTM5, `bsd/dev/bluejay_touch.c`) but depends on ABL leaving the touch supplies on; step 1 tells. If they are off, switching them on needs the PMIC's ACPM mailbox protocol (not written).
+* **Touch** is written (ST FTM5, `bsd/dev/bluejay_touch.c`) but depends on ABL leaving the touch supplies on; step 1 tells. If they are off, the shim now switches them on through the PMIC ACPM mailbox before handing control to XNU. Kernel/iOS input remains unverified.
 * **No log reader**: there is no TWRP for the 6a, so the persistent log at the end of `userdata` can't be pulled the way sweet and the A40 do it. Use the screen and the UART.
 * GPU, Wi-Fi, cellular, audio, cameras, USB, battery readout, power management: none.

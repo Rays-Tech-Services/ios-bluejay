@@ -1040,7 +1040,6 @@ static void zero32(u64 a, u32 n)
 		wr32(a + i, 0);
 }
 
-static u8 ufs_tag;
 static u64 ufs_ucd_override;	/* 0: the shim's buffer, else ABL's command buffer */
 
 /*
@@ -1054,7 +1053,6 @@ static u32 ufs_cmd(u64 hci, u64 list, int slot, u8 lun, const u8 *cdb, int cdb_l
 	zero32(ucd, 1024 + 16);
 	zero32(utrd, 32);
 	/* task tag = slot, as Linux does: the Exynos host matches responses by it */
-	(void)ufs_tag;
 	wr32(ucd + 0, (u32)0x01 | (len ? 0x40u : 0) << 8 | (u32)lun << 16 | (u32)slot << 24);
 	wr32(ucd + 12, __builtin_bswap32(len));
 	u32 c[4] = { 0, 0, 0, 0 };
@@ -1073,20 +1071,29 @@ static u32 ufs_cmd(u64 hci, u64 list, int slot, u8 lun, const u8 *cdb, int cdb_l
 	wr32(utrd + 20, (u32)(ucd >> 32));
 	wr32(utrd + 24, 512u << 16 | 512u);
 	wr32(utrd + 28, 1024u << 16 | (len ? 16u : 0u));
+	/* Acknowledge the preceding completion before every new request,
+	 * including READ immediately after TUR. We poll rather than use IRQs. */
+	wr32(hci + UFS_IS, rd32(hci + UFS_IS));
 	__asm__ volatile("dsb sy" ::: "memory");
 	wr32(hci + UFS_DBR, 1u << slot);
 	u64 t0 = now();
 	while (rd32(hci + UFS_DBR) & (1u << slot))
-		if (now() - t0 > timer_hz)			/* 1 s */
+		if (now() - t0 > timer_hz * (cdb[0] == 0x1b ? 10u : 1u))
 			return 0x200;
-	wr32(hci + UFS_IS, rd32(hci + UFS_IS));
+	__asm__ volatile("dsb sy" ::: "memory");
 	u32 ocs = rd32(utrd + 8) & 0xff;
-	if (ocs)
-		return ocs;
 	u32 r0 = rd32(ucd + 512);
+	u32 r1 = rd32(ucd + 516);
+	/* GS101's BROKEN_OCS_FATAL_ERROR quirk: a matching error response
+	 * remains a SCSI error, not an unqualified controller failure. */
+	int matching = (r0 & 0xff) == 0x21 && ((r0 >> 16) & 0xff) == lun &&
+	    (r0 >> 24) == (u32)slot;
+	if (ocs && !(ocs == 7 && matching && (r1 & 0xffff0000u)))
+		return ocs;
+	if (!matching)
+		return 0x300 | (r0 & 0xff);
 	if ((r0 & 0xff) != 0x21)			/* RESPONSE UPIU */
 		return 0x300 | (r0 & 0xff);
-	u32 r1 = rd32(ucd + 512 + 4);			/* response, status in bytes 6/7 */
 	return (r1 >> 16) & 0xffff ? 0x100 | ((r1 >> 24) & 0xff) : 0;
 }
 
@@ -1150,7 +1157,7 @@ static u32 ufs_uic(u64 hci, u32 cmd, u32 arg1, u32 *arg3)
 	return rd32(hci + UFS_UICARG2) & 0xff;
 }
 
-static void diag_ufs_test(u64 dtb)
+static void prepare_ufs(u64 dtb, int test)
 {
 	struct fdt f;
 	u64 hci = 0, hs, vs = 0, vss;
@@ -1167,15 +1174,13 @@ static void diag_ufs_test(u64 dtb)
 		return;
 	}
 	u64 list = rd32(hci + UFS_UTRLBA) | (u64)rd32(hci + UFS_UTRLBAU) << 32;
+	/* No interrupt aggregation is needed for one polled slot. */
+	kv("  ABL interrupt aggregation ", rd32(hci + 0x4c));
+	wr32(hci + 0x4c, 0);
 	/* E1: where ABL left things */
 	kv2("  E1 CLKSTOP ", rd32(vs + 0xb0), " MISC ", rd32(vs + 0xb4));
 	kv2("     IS ", rd32(hci + UFS_IS), " HCS ", rd32(hci + UFS_HCS));
 	kv2("     list ", list, " RSR ", rd32(hci + UFS_RSR));
-	u64 abl_ucd = rd32(list + 16) | (u64)rd32(list + 20) << 32;
-	kv2("     ABL s0 dw0 ", rd32(list), " ucd ", abl_ucd);
-	kv2("     ABL s0 resp/prdt ", rd32(list + 24), " ", rd32(list + 28));
-	if (abl_ucd)
-		kv2("     ABL cmd upiu ", rd32(abl_ucd), " ", rd32(abl_ucd + 16));
 	u32 pm = 0;
 	u32 r = ufs_uic(hci, 0x01, 0x1571u << 16, &pm);		/* DME_GET PA_PWRMODE */
 	kv2("     DME_GET PA_PWRMODE result ", r, " value ", pm);
@@ -1187,18 +1192,67 @@ static void diag_ufs_test(u64 dtb)
 	kv2("  E2 H8 exit result ", r, " HCS ", rd32(hci + UFS_HCS));
 	kv("     IS ", rd32(hci + UFS_IS));
 	wr32(hci + UFS_IS, rd32(hci + UFS_IS));
-	u32 e = ufs_tur(hci, list, 1);
-	ufs_show("  E3 TUR tag=slot", hci, e);
-	if (e == 0) {
-		static const u8 rd10[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0 };
-		u64 data = sym_addr_data();
-		zero32(data, 16);
-		ufs_clear_slot(hci, 1);
-		e = ufs_cmd(hci, list, 1, 0, rd10, 10, data, 4096);
-		kv2("  E4 READ LBA1 ", e, " first word ", rd32(data));
-		say(rd32(data) == 0x20494645 ? C_OK : C_WARN,
-		    rd32(data) == 0x20494645 ? "  EFI PART: storage works" : "  no GPT header");
+	/* Resume the device itself as Linux ufshcd_set_dev_pwr_mode does.
+	 * UPIU WLUN 0xd0 is the device WLUN; ACTIVE is power condition 1.
+	 * These commands do not write logical blocks. */
+	static const u8 sense[6] = { 0x03, 0, 0, 0, 18, 0 };
+	static const u8 active[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
+	if (!ufs_clear_slot(hci, 1)) {
+		say(C_WARN, "  pending slot: wake skipped");
+		return;
 	}
+	u32 wake = ufs_cmd(hci, list, 1, 0xd0, sense, 6, sym_addr_data(), 18);
+	kv("  DEVICE request sense ", wake);
+	if (!ufs_clear_slot(hci, 1))
+		return;
+	wr32(hci + UFS_IS, rd32(hci + UFS_IS));
+	wake = ufs_cmd(hci, list, 1, 0xd0, active, 6, 0, 0);
+	kv("  DEVICE ACTIVE ", wake);
+	if (!ufs_clear_slot(hci, 1))
+		return;
+	delay_ms(100);
+	if (!test)
+		return;
+	static const u8 tur[6] = { 0 };
+	static const u8 rd10[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0 };
+	for (u8 lun = 0; lun < 8; lun++) {
+		/* Never reuse the shared command buffer while DMA may be pending. */
+		if (!ufs_clear_slot(hci, 1)) {
+			say(C_WARN, "  pending slot cannot clear: scan stopped");
+			break;
+		}
+		wr32(hci + UFS_IS, rd32(hci + UFS_IS));
+		u32 e = ufs_cmd(hci, list, 1, lun, tur, 6, 0, 0);
+		u64 resp = sym_addr_ucd() + 512;
+		puts_("  LUN "); puthex(lun, 1);
+		puts_(" TUR "); puthex(e, 3);
+		puts_(" OCS "); puthex(rd32(list + 32 + 8) & 0xff, 2);
+		puts_(" DBR "); puthex(rd32(hci + UFS_DBR), 8); newline();
+		/* Fixed-format sense: key at byte 2, ASC/ASCQ at bytes 12/13. */
+		u32 sk = rd32(resp + 36) & 0xf;
+		u32 asc = rd32(resp + 44) >> 16;
+		puts_("    rsp1 "); puthex(rd32(resp + 4), 8);
+		puts_(" key "); puthex(sk, 1);
+		puts_(" ASC/ASCQ (LE) "); puthex(asc, 4); newline();
+		if (e != 0)
+			continue;
+		u64 data = sym_addr_data();
+		zero32(data, 4096);
+		e = ufs_cmd(hci, list, 1, lun, rd10, 10, data, 4096);
+		kv2("    READ LBA1 ", e, " first word ", rd32(data));
+		kv2("    second word ", rd32(data + 4), " DBR ", rd32(hci + UFS_DBR));
+		kv2("    read OCS ", rd32(list + 40), " response ", rd32(resp));
+		kv2("    read rsp1 ", rd32(resp + 4), " IS ", rd32(hci + UFS_IS));
+		int gpt = e == 0 && rd32(data) == 0x20494645 && rd32(data + 4) == 0x54524150;
+		say(gpt ? C_OK : C_WARN, gpt ? "  EFI PART: storage works" : "  no GPT header");
+		/* Stop on a read timeout so subsequent commands do not obscure it. */
+		if (gpt || e == 0x200)
+			break;
+	}
+	/* Quiesce the final timed-out command, too. */
+	if (!ufs_clear_slot(hci, 1))
+		say(C_WARN, "  final slot remains pending");
+
 }
 
 static void __attribute__((noreturn)) diag(u64 dtb)
@@ -1223,8 +1277,8 @@ static void __attribute__((noreturn)) diag(u64 dtb)
 	watchdogs_off(dtb, 1);
 	say(C_DIM, "UFS (ABL must leave the link up):");
 	diag_ufs(dtb);
-	say(C_DIM, "UFS command test (read-only):");
-	diag_ufs_test(dtb);
+	say(C_DIM, "UFS test (wake + reads; no block writes):");
+	prepare_ufs(dtb, 1);
 	say(C_DIM, "touch power (PMIC LDO25M/26M via ACPM):");
 	if (!fdt_has_decon(dtb))
 		say(C_DIM, "  not a GS101 (no DECON in the tree): skipped");
@@ -1361,6 +1415,10 @@ __attribute__((used)) void shim_main(u64 dtb, u64 base, u64 entry_el)
 	/* Touch supplies on before XNU (bsd/dev/bluejay_touch.c resets the chip). */
 	if (fdt_has_decon(dtb) && !payload_flag(p, "shimtouchpwr=0"))
 		touch_power(1);
+	/* ABL leaves both the UFS link and device asleep. Resume them using
+	 * the same sequence verified by the diagnostic's GPT read. */
+	if (fdt_has_decon(dtb) && !payload_flag(p, "shimufs=0"))
+		prepare_ufs(dtb, 0);
 
 	u64 pa_of_va = p->phys_base - p->virt_base;
 	kv2("XNU RAM ", p->phys_base, " size ", p->mem_size);

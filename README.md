@@ -2,7 +2,8 @@
 
 A port of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (iOS 16 on the Redmi Note 10 Pro) and [iOS16-on-A40](https://github.com/tlfares/iOS16-on-A40) (the same on the Galaxy A40) to the **Google Pixel 6a** (`bluejay`, Google Tensor / GS101), plus a **QEMU setup** that runs the Pixel boot chain on a Mac or Linux PC.
 
-> **Status (2026-10-20): iOS 16 boots to the lock screen in QEMU; not yet run on a Pixel 6a.** The bluejay kernel (built by the `xnu-bluejay` workflow) boots through the real shim on QEMU's virt board, set up like the Pixel (EL2 entry, GICv3, Pixel memory map), mounts the iOS 16.7.16 root from a virtio disk, and SpringBoard draws the lock screen (clock, battery, camera button) through the kernel's display driver: `tools/qemu-ios.sh`. On real hardware nothing has run yet: the hardware facts come from Google's bluejay kernel tree, mainline Linux and the Pixel 6 device tree, the unmeasured ones are marked **VERIFY** in [docs/hardware.md](docs/hardware.md), and the shim's diagnostic boot checks each of them (including display refresh and the touch chip).
+> **Status (2026-10-20): iOS 16 reaches the lock screen in QEMU. On the real Pixel 6a, XNU boots through display, interrupts and timer to storage probing.** The shim now successfully wakes UFS and reads the GPT header (`EFI PART`, command status 0 and doorbell clear). ST FTM5 touch identification and finger coordinates are verified in the shim. The normal shim boot path includes UFS wake and touch power-up; the updated kernel storage path and touch input still need verification on the phone. Android userdata has not been replaced with an iOS root.
+
 
 ## Why the Pixel 6a is a good target
 
@@ -108,7 +109,7 @@ What QEMU cannot test: the Pixel's UFS controller, buttons, Samsung UART, watchd
 
 ## Not done
 
-Touch (Goodix over SPI), full UFS initialisation if ABL turns UFS off, reading the persistent log without a custom recovery, and everything ios-sweet lists as missing (GPU, radios, audio, cameras, power management). See [docs/bringup.md](docs/bringup.md#known-gaps).
+Touch input in XNU/iOS (ST FTM5 over SPI; working in the shim), full UFS initialisation if ABL turns UFS off, reading the persistent log without a custom recovery, and everything ios-sweet lists as missing (GPU, radios, audio, cameras, power management). See [docs/bringup.md](docs/bringup.md#known-gaps).
 
 ## Credits
 

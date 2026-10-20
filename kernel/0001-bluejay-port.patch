@@ -375,7 +375,7 @@ index 0000000..2191952
 +	return 1;
 +}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 53e5095..e9160f0 100644
+index 53e5095..6d5def7 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -14,6 +14,14 @@
@@ -438,6 +438,15 @@ index 53e5095..e9160f0 100644
  	int bmajor, cmajor;
  	dev_t bdev;
  	bool ready;
+@@ -165,7 +182,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+ 	ucd->cmd[2] = su.lun;
+-	ucd->cmd[3] = ++su.tag;
++	ucd->cmd[3] = su.exynos ? 0 : ++su.tag; /* Exynos task tag matches slot 0 */
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+ 	ucd->cmd[14] = (uint8_t)(len >> 8);
 @@ -177,16 +194,20 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
  	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
  	utrd->ucdba = (uint32_t)ucd_pa;
@@ -477,7 +486,16 @@ index 53e5095..e9160f0 100644
  		}
  	} else {
  		dma_sync(DMA_UTRL, sizeof(*utrd));
-@@ -225,7 +245,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+@@ -210,6 +230,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 	__builtin_arm_dsb(0xf);
+ 
++	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* clear previous completion before every command */
++	__builtin_arm_dsb(0xf);
+ 	ufs_wr(REG_UTRLDBR, 1);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+@@ -225,7 +247,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
  	while (ufs_rd(REG_UTRLDBR) & 1) {
  		uint64_t now = mach_absolute_time();
  		if (now > deadline) {
@@ -486,7 +504,7 @@ index 53e5095..e9160f0 100644
  			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
  			return ETIMEDOUT;
  		}
-@@ -391,6 +411,17 @@ ufs_find_partition(const char *want)
+@@ -391,6 +413,17 @@ ufs_find_partition(const char *want)
  	return ENOENT;
  }
  
@@ -504,7 +522,7 @@ index 53e5095..e9160f0 100644
  static int
  ufs_take_over_host(void)
  {
-@@ -404,11 +435,24 @@ ufs_take_over_host(void)
+@@ -404,12 +437,28 @@ ufs_take_over_host(void)
  		return EBUSY;
  	}
  	/* With RAM above 4 GiB (mkadt.py --highmem) the DMA memory can be there too. */
@@ -528,9 +546,13 @@ index 53e5095..e9160f0 100644
 +		    *(volatile uint32_t *)(su.vs_regs + 0x40));
 +	}
  	ufs_wr(REG_IE, 0);                      /* polled operation */
++	if (su.exynos) {
++		ufs_wr(0x4c, 0);                    /* no interrupt aggregation for polling */
++	}
  	ufs_wr(REG_IS, ufs_rd(REG_IS));
  	ufs_wr(REG_UTRLRSR, 0);
-@@ -650,6 +694,33 @@ sweet_ufs_init(void)
+ 	uint64_t list = su.dma_pa + DMA_UTRL;
+@@ -650,6 +699,33 @@ sweet_ufs_init(void)
  	if (!a40_node) {
  		su.regs = ml_io_map(reg[0], reg[1]);
  	}
@@ -564,7 +586,7 @@ index 53e5095..e9160f0 100644
  	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
  	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
  		printf("SWEET UFS: no contiguous DMA memory\n");
-@@ -660,7 +731,7 @@ sweet_ufs_init(void)
+@@ -660,7 +736,7 @@ sweet_ufs_init(void)
  		return ENOMEM;
  	}
  	su.dma_pa = ptoa_64(pn);
@@ -573,7 +595,7 @@ index 53e5095..e9160f0 100644
  	su.secsize = DEV_BSIZE;
  
  	lck_mtx_lock(&sweet_ufs_lock);
-@@ -674,13 +745,19 @@ sweet_ufs_init(void)
+@@ -674,13 +750,19 @@ sweet_ufs_init(void)
  	}
  	error = ufs_take_over_host();
  	if (!error) {
