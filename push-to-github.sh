@@ -1,9 +1,9 @@
 #!/bin/bash
 # Push this repo to https://github.com/Rays-Tech-Services/ios-bluejay
 #
-#   ./push-to-github.sh            # creates the repo as private if it does not exist
-#   ./push-to-github.sh --public   # ... or as public
+#   ./push-to-github.sh
 #
+# The repo already exists on GitHub (public).
 # Installs the GitHub CLI (gh) with Homebrew if needed and walks you through
 # logging in. The login asks for the "workflow" scope because the repo
 # contains .github/workflows/xnu-bluejay.yml; GitHub refuses pushes of
@@ -15,8 +15,6 @@ OWNER=Rays-Tech-Services
 NAME=ios-bluejay
 REPO="$OWNER/$NAME"
 URL="https://github.com/$REPO.git"
-VISIBILITY=--private
-[ "${1:-}" = "--public" ] && VISIBILITY=--public
 
 # 1. GitHub CLI
 if ! command -v gh >/dev/null; then
@@ -34,14 +32,8 @@ elif ! gh auth status 2>&1 | grep -q "workflow"; then
 fi
 gh auth setup-git	# let git use gh's credentials for https://github.com
 
-# 3. Create the repo if it does not exist yet
-if gh repo view "$REPO" >/dev/null 2>&1; then
-	echo "Repo $REPO exists."
-else
-	echo "Creating $REPO (${VISIBILITY#--})..."
-	gh repo create "$REPO" "$VISIBILITY" \
-		--description "iOS 16 on the Google Pixel 6a (bluejay): port of ios-sweet / iOS16-on-A40, with a QEMU test harness"
-fi
+# 3. Make sure we can see it
+gh repo view "$REPO" >/dev/null || { echo "Cannot access $REPO with this login."; exit 1; }
 
 # 4. Remote and push
 if git remote get-url origin >/dev/null 2>&1; then
