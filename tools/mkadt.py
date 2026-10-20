@@ -68,7 +68,7 @@ KEYS = [
 ]
 
 # ---------------------------------------------------------------- QEMU virt
-QEMU_GICD, QEMU_GICR, QEMU_GICR_SIZE = 0x08000000, 0x080a0000, 0xf60000
+QEMU_GICD, QEMU_GICR, QEMU_GICR_SIZE = 0x08000000, 0x080a0000, 0x100000
 QEMU_TIMEBASE = 62500000                     # cortex-a76 under TCG
 QEMU_UART = 0x09000000
 QEMU_VIRTIO, QEMU_VIRTIO_SIZE = 0x0a000000, 0x4000
@@ -146,7 +146,9 @@ def build(seed=None, qemu=False):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('google,gs101') + cstr(compat) + cstr('ARM,v8')),
+            # SweetCPU attaches through IONameMatch 'qcom,kryo470'
+            # (iokit/KernelConfigTables.cpp): without it no CPU starts.
+            ('compatible', cstr('qcom,kryo470') + cstr('google,gs101') + cstr(compat) + cstr('ARM,v8')),
             ('reg', u32(core << 8)),        # MPIDR Aff1:Aff0
             ('cpu-id', u32(core)),
             ('cluster-id', u32(0)),
@@ -159,7 +161,7 @@ def build(seed=None, qemu=False):
             ('timebase-frequency', u32(timebase)),
             ('clock-frequency', u32(hz)),
             ('bus-frequency', u32(100000000)),
-            ('memory-frequency', u32(3200000000)),
+            ('memory-frequency', u32(1866000000)),     # keep below 2^31: read as int
             ('peripheral-frequency', u32(timebase)),
             ('fixed-frequency', u32(timebase)),
         ]))
