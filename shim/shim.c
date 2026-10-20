@@ -1053,7 +1053,9 @@ static u32 ufs_cmd(u64 hci, u64 list, int slot, u8 lun, const u8 *cdb, int cdb_l
 	u64 ucd = ufs_ucd_override ? ufs_ucd_override : sym_addr_ucd(), utrd = list + 32 * slot;
 	zero32(ucd, 1024 + 16);
 	zero32(utrd, 32);
-	wr32(ucd + 0, (u32)0x01 | (len ? 0x40u : 0) << 8 | (u32)lun << 16 | (u32)(++ufs_tag) << 24);
+	/* task tag = slot, as Linux does: the Exynos host matches responses by it */
+	(void)ufs_tag;
+	wr32(ucd + 0, (u32)0x01 | (len ? 0x40u : 0) << 8 | (u32)lun << 16 | (u32)slot << 24);
 	wr32(ucd + 12, __builtin_bswap32(len));
 	u32 c[4] = { 0, 0, 0, 0 };
 	for (int i = 0; i < cdb_len; i++)
@@ -1177,21 +1179,16 @@ static void diag_ufs_test(u64 dtb)
 	u32 pm = 0;
 	u32 r = ufs_uic(hci, 0x01, 0x1571u << 16, &pm);		/* DME_GET PA_PWRMODE */
 	kv2("     DME_GET PA_PWRMODE result ", r, " value ", pm);
-	/* E2: ABL's list and ABL's command buffer: only memory the controller already used */
-	if (abl_ucd && abl_ucd < 0x100000000UL)
-		ufs_ucd_override = abl_ucd;
-	ufs_show("  E2 abl ucd", hci, ufs_tur(hci, list, 1));
-	/* E3: un-gate the controller clocks like Linux (exynos_ufs_ctrl_clkstop(false)) */
+	/* Linux order: ungate clocks, then DME_HIBERNATE_EXIT (ABL leaves the link in H8) */
 	wr32(vs + 0xb0, rd32(vs + 0xb0) & ~0x1fu);
 	wr32(vs + 0xb4, rd32(vs + 0xb4) & ~0xe0u);
-	kv2("  E3 CLKSTOP ", rd32(vs + 0xb0), " MISC ", rd32(vs + 0xb4));
-	ufs_show("  E3 ungated", hci, ufs_tur(hci, list, 1));
-	/* E4: link out of Hibern8 */
-	r = ufs_uic(hci, 0x18, 0, 0);					/* DME_HIBERNATE_EXIT */
+	r = ufs_uic(hci, 0x18, 0, 0);
 	delay_ms(5);
-	kv2("  E4 H8 exit result ", r, " HCS ", rd32(hci + UFS_HCS));
+	kv2("  E2 H8 exit result ", r, " HCS ", rd32(hci + UFS_HCS));
+	kv("     IS ", rd32(hci + UFS_IS));
+	wr32(hci + UFS_IS, rd32(hci + UFS_IS));
 	u32 e = ufs_tur(hci, list, 1);
-	ufs_show("  E4 after H8 exit", hci, e);
+	ufs_show("  E3 TUR tag=slot", hci, e);
 	if (e == 0) {
 		static const u8 rd10[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 1, 0 };
 		u64 data = sym_addr_data();
