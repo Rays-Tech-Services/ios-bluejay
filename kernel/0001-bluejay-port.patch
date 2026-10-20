@@ -1,0 +1,673 @@
+diff --git a/bsd/dev/a40_keys.c b/bsd/dev/a40_keys.c
+index 73ba0e4..040186d 100644
+--- a/bsd/dev/a40_keys.c
++++ b/bsd/dev/a40_keys.c
+@@ -4,6 +4,10 @@
+  * as inputs (gpio-keys pin function 0xf = EINT, DAT still reads the level).
+  * Polled every 20 ms from a kernel thread; reported like the SWEET keys:
+  * 0 = power (gpa1-7), 1 = volume up (gpa1-5), 2 = volume down (gpa1-6).
++ *
++ * Pixel 6a (and any board with an ADT /gpio-keys node): the same polling for
++ * a table of keys = <u64 DAT register PA, u32 bit, u32 key index>, active low
++ * unless bit 31 of the bit field is set (tools/mkadt.py).
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -24,6 +28,69 @@ int a40_platform(void);
+ static vm_offset_t a40_gpa1;
+ static int a40_keys_chan;
+ 
++#define GPIO_KEYS_MAX   8
++static struct {
++	volatile uint32_t *dat;
++	uint32_t bit;
++	bool active_high;
++	int key;
++	int down;
++} gk[GPIO_KEYS_MAX];
++static unsigned int gk_count;
++
++static void
++gpio_keys_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		for (unsigned int i = 0; i < gk_count; i++) {
++			uint32_t dat = *gk[i].dat;
++			int level = (dat >> gk[i].bit) & 1;
++			int down = gk[i].active_high ? level : !level;
++			if (down != gk[i].down) {
++				gk[i].down = down;
++				printf("SWEET GPIO KEYS: key=%d down=%d dat=%#x\n", gk[i].key, down, dat);
++				sweet_hid_key(gk[i].key, down);
++			}
++		}
++		assert_wait_timeout((event_t)&a40_keys_chan, THREAD_UNINT, 20, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
++/* Returns 1 when the ADT has a /gpio-keys table (and polling started). */
++static int
++gpio_keys_init(void)
++{
++	DTEntry node;
++	uint8_t const *t;
++	unsigned int size;
++	thread_t th;
++
++	if (SecureDTLookupEntry(NULL, "/gpio-keys", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "keys", (void const **)&t, &size) != kSuccess || size < 16) {
++		return 0;
++	}
++	for (unsigned int off = 0; off + 16 <= size && gk_count < GPIO_KEYS_MAX; off += 16) {
++		uint64_t pa;
++		uint32_t bit, key;
++		memcpy(&pa, t + off, 8);
++		memcpy(&bit, t + off + 8, 4);
++		memcpy(&key, t + off + 12, 4);
++		gk[gk_count].dat = (volatile uint32_t *)(ml_io_map(pa & ~0x3fffULL, 0x4000) + (pa & 0x3fff));
++		gk[gk_count].bit = bit & 31;
++		gk[gk_count].active_high = (bit >> 31) != 0;
++		gk[gk_count].key = (int)key;
++		gk[gk_count].down = 0;
++		printf("SWEET GPIO KEYS: key %u at %#llx bit %u, now %#x\n", key, pa, bit & 31,
++		    *gk[gk_count].dat);
++		gk_count++;
++	}
++	if (kernel_thread_start(gpio_keys_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++	return 1;
++}
++
+ static void
+ a40_keys_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -51,7 +118,8 @@ a40_platform(void)
+ {
+ 	DTEntry node;
+ 	return SecureDTLookupEntry(NULL, "/a40-mmc", &node) == kSuccess ||
+-	       SecureDTLookupEntry(NULL, "/a40-virtio", &node) == kSuccess;
++	       SecureDTLookupEntry(NULL, "/a40-virtio", &node) == kSuccess ||
++	       SecureDTLookupEntry(NULL, "/bluejay", &node) == kSuccess;
+ }
+ 
+ /* A40 diag: A73 cluster clock (CMU_CPUCL0) and measured core frequency. */
+@@ -88,6 +156,9 @@ a40_keys_init(void)
+ 	if (SecureDTLookupEntry(NULL, "/a40-mmc", &node) == kSuccess) {
+ 		a40_clock_report();
+ 	}
++	if (gpio_keys_init()) {
++		return 1;
++	}
+ 	if (SecureDTLookupEntry(NULL, "/a40-keys", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
+ 		return a40_platform();  /* A40 without keys (QEMU): never probe sweet's SPMI */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 53e5095..e9160f0 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -14,6 +14,14 @@
+  * a 1 MiB bounce buffer); the host is not cache coherent, so caches are
+  * cleaned/invalidated around each command.
+  *
++ * Exynos UFS (Pixel 6a, ADT /sweet-ufs "exynos" = 1), as in Linux ufs-exynos.c:
++ * UTRD response/PRDT offsets and lengths in bytes (PRDT_BYTE_GRAN), PRDT
++ * segments of at most 4 KiB, PRDT entries of "prdt-entry-size" bytes (16, or
++ * 32 with the Flash Memory Protector format), UTRLCLR clears with 1 bits,
++ * 36-bit DMA instead of the 64AS capability. The LUN comes from the ADT "lun"
++ * or boot-arg ufslun=; without ufslun= LUNs 0-7 are searched for the
++ * partition.
++ *
+  * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
+@@ -73,6 +81,9 @@ extern void sweet_usb_probe(void);
+ #define BOUNCE_SIZE     (1u << 20)
+ #define PRDT_CHUNK      (256u << 10)            /* PRDT byte count field: 18 bits */
+ #define PRDT_MAX        (BOUNCE_SIZE / PRDT_CHUNK)
++#define EXYNOS_CHUNK    4096u                   /* HCI_TX/RXPRDT_ENTRY_SIZE = 12 */
++#define EXYNOS_PRDT_MAX (BOUNCE_SIZE / EXYNOS_CHUNK)
++#define PRDT_ESZ_MAX    32u
+ #define CMD_TIMEOUT_NS  (5ull * NSEC_PER_SEC)
+ #define CMD_SPIN_NS     (50ull * NSEC_PER_USEC)
+ #define CMD_SLEEP_NS    (200ull * NSEC_PER_USEC)
+@@ -84,18 +95,21 @@ struct utrd {
+ 	uint32_t prdt;          /* [31:16] PRDT offset (DWORDs), [15:0] entries */
+ };
+ 
++struct prdt_entry {
++	uint32_t addr_lo, addr_hi, rsvd, dbc;   /* Exynos FMP: 16 more bytes follow */
++};
++
+ struct ucd {
+ 	uint8_t cmd[512];
+ 	uint8_t resp[512];
+-	struct {
+-		uint32_t addr_lo, addr_hi, rsvd, dbc;
+-	} prdt[PRDT_MAX];
++	uint8_t prdt[EXYNOS_PRDT_MAX * PRDT_ESZ_MAX];   /* entries of su.prdt_esz bytes */
+ };
+ 
+ /* Layout of the contiguous DMA allocation. */
+ #define DMA_UTRL        0x0000                  /* 1 KiB aligned */
+ #define DMA_UCD         0x1000                  /* 128 byte aligned */
+ #define DMA_BOUNCE      0x4000
++_Static_assert(DMA_UCD + sizeof(struct ucd) <= DMA_BOUNCE, "UCD overlaps the bounce buffer");
+ #define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
+ 
+ static struct {
+@@ -109,6 +123,9 @@ static struct {
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool exynos;                            /* ADT "exynos": Exynos UFS quirks */
++	uint32_t prdt_esz;                      /* PRDT entry size in bytes */
++	vm_offset_t vs_regs;                    /* Exynos vendor HCI, or 0 */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -177,16 +194,20 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	utrd->dw2 = 0x0f;                       /* OCS invalid until updated */
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+-	utrd->resp = (512u / 4) << 16 | (512u / 4);
++	/* Offsets/lengths: DWORDs (UFSHCI), bytes on Exynos (PRDT_BYTE_GRAN). */
++	uint32_t unit = su.exynos ? 1u : 4u;
++	utrd->resp = (512u / unit) << 16 | (512u / unit);
++	uint32_t nprdt = 0;
+ 	if (len) {
+-		uint32_t n = 0;
+-		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+-			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
+-			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+-			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+-			ucd->prdt[n].dbc = chunk - 1;
++		uint32_t seg = su.exynos ? EXYNOS_CHUNK : PRDT_CHUNK;
++		for (uint32_t done = 0; done < len; done += seg, nprdt++) {
++			uint32_t chunk = MIN(seg, len - done);
++			struct prdt_entry *e = (struct prdt_entry *)(ucd->prdt + nprdt * su.prdt_esz);
++			e->addr_lo = (uint32_t)(bounce_pa + done);
++			e->addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			e->dbc = chunk - 1;
+ 		}
+-		utrd->prdt = (1024u / 4) << 16 | n;
++		utrd->prdt = (1024u / unit) << 16 | (su.exynos ? nprdt * su.prdt_esz : nprdt);
+ 	}
+ 
+ 	if (su.cache) {
+@@ -194,8 +215,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		dma_clean(DMA_UCD, 16 + cdb_len);
+ 		dma_sync(DMA_UCD + offsetof(struct ucd, resp), sizeof(ucd->resp));
+ 		if (len) {
+-			dma_clean(DMA_UCD + offsetof(struct ucd, prdt),
+-			    (utrd->prdt & 0xffff) * sizeof(ucd->prdt[0]));
++			dma_clean(DMA_UCD + offsetof(struct ucd, prdt), nprdt * su.prdt_esz);
+ 		}
+ 	} else {
+ 		dma_sync(DMA_UTRL, sizeof(*utrd));
+@@ -225,7 +245,7 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	while (ufs_rd(REG_UTRLDBR) & 1) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+-			ufs_wr(REG_UTRLCLR, ~1u);
++			ufs_wr(REG_UTRLCLR, su.exynos ? 1u : ~1u);     /* Exynos: inverted */
+ 			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
+ 			return ETIMEDOUT;
+ 		}
+@@ -391,6 +411,17 @@ ufs_find_partition(const char *want)
+ 	return ENOENT;
+ }
+ 
++/* TEST UNIT READY (the first command after the bootloader may report a unit attention), then the GPT. */
++static int
++ufs_probe_lun(const char *want)
++{
++	static const uint8_t tur[6] = { 0x00 };
++	int error = 0;
++	for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++	}
++	return error ? error : ufs_find_partition(want);
++}
++
+ static int
+ ufs_take_over_host(void)
+ {
+@@ -404,11 +435,24 @@ ufs_take_over_host(void)
+ 		return EBUSY;
+ 	}
+ 	/* With RAM above 4 GiB (mkadt.py --highmem) the DMA memory can be there too. */
+-	if (((su.dma_pa + DMA_SIZE - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
++	if (su.exynos) {
++		/* Exynos: 36-bit DMA whatever CAP says (Linux exynos_ufs_set_dma_mask) */
++		if ((su.dma_pa + DMA_SIZE - 1) >> 36) {
++			printf("SWEET UFS: DMA memory at 0x%llx is above the 36-bit limit\n", su.dma_pa);
++			return ENXIO;
++		}
++	} else if (((su.dma_pa + DMA_SIZE - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
+ 		printf("SWEET UFS: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
+ 		    su.dma_pa);
+ 		return ENXIO;
+ 	}
++	if (su.vs_regs) {
++		/* slot 0 carries SCSI commands (Linux sets every bit of HCI_UTRL_NEXUS_TYPE) */
++		*(volatile uint32_t *)(su.vs_regs + 0x40) |= 1;
++		printf("SWEET UFS: Exynos TXPRDT 0x%x RXPRDT 0x%x NEXUS 0x%x\n",
++		    *(volatile uint32_t *)(su.vs_regs + 0x00), *(volatile uint32_t *)(su.vs_regs + 0x04),
++		    *(volatile uint32_t *)(su.vs_regs + 0x40));
++	}
+ 	ufs_wr(REG_IE, 0);                      /* polled operation */
+ 	ufs_wr(REG_IS, ufs_rd(REG_IS));
+ 	ufs_wr(REG_UTRLRSR, 0);
+@@ -650,6 +694,33 @@ sweet_ufs_init(void)
+ 	if (!a40_node) {
+ 		su.regs = ml_io_map(reg[0], reg[1]);
+ 	}
++	uint32_t const *u;
++	uint64_t const *vs;
++	unsigned int usz;
++	su.prdt_esz = sizeof(struct prdt_entry);
++	if (!a40_node && SecureDTGetProperty(node, "exynos", (void const **)&u, &usz) == kSuccess &&
++	    usz == 4 && *u) {
++		su.exynos = true;
++		if (SecureDTGetProperty(node, "prdt-entry-size", (void const **)&u, &usz) == kSuccess && usz == 4) {
++			su.prdt_esz = *u;
++		}
++		if (SecureDTGetProperty(node, "vs-hci", (void const **)&vs, &usz) == kSuccess && usz >= 16) {
++			su.vs_regs = ml_io_map(vs[0], vs[1]);
++		}
++	}
++	uint32_t esz = 0;
++	if (PE_parse_boot_argn("ufsprdt", &esz, sizeof(esz))) {
++		su.prdt_esz = esz;
++	}
++	if (su.prdt_esz != 16 && su.prdt_esz != 32) {
++		printf("SWEET UFS: bad PRDT entry size %u\n", su.prdt_esz);
++		return EINVAL;
++	}
++	uint32_t lun = 0, lun_fixed = 0;
++	if (!a40_node && SecureDTGetProperty(node, "lun", (void const **)&u, &usz) == kSuccess && usz == 4) {
++		lun = *u;
++	}
++	lun_fixed = PE_parse_boot_argn("ufslun", &lun, sizeof(lun));
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+@@ -660,7 +731,7 @@ sweet_ufs_init(void)
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+-	su.lun = 0;
++	su.lun = (uint8_t)lun;
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+@@ -674,13 +745,19 @@ sweet_ufs_init(void)
+ 	}
+ 	error = ufs_take_over_host();
+ 	if (!error) {
+-		static const uint8_t tur[6] = { 0x00 };
+-		/* The first command after the bootloader may report a unit attention. */
+-		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		/* The configured LUN first, then (unless ufslun= pinned it) the rest of 0-7. */
++		int e = ENOENT;
++		for (int i = -1; i < 8; i++) {
++			if (i >= 0 && (lun_fixed || i == (int)lun)) {
++				continue;
++			}
++			su.lun = (uint8_t)(i < 0 ? lun : (uint32_t)i);
++			if (!(e = ufs_probe_lun(want))) {
++				break;
++			}
++			printf("SWEET UFS: \"%s\" not on LUN %u (error %d)\n", want, su.lun, e);
+ 		}
+-	}
+-	if (!error) {
+-		error = ufs_find_partition(want);
++		error = e;
+ 	}
+ probed:
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index b6c1a41..fc3a311 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -82,7 +82,8 @@ sweet_usb_probe(void)
+ 
+ 	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
+-	if (!enabled) {
++	extern int a40_platform(void);
++	if (!enabled || a40_platform()) {       /* Qualcomm-only addresses below */
+ 		return;
+ 	}
+ 	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739..72863ac 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -14,6 +14,7 @@
+ #include <pexpert/pexpert.h>
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
++extern "C" int a40_platform(void);     /* bsd/dev/a40_keys.c: not the Qualcomm sweet */
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
+ class SweetBattery : public IOPMPowerSource {
+@@ -264,7 +265,8 @@ SweetBattery::start(IOService *provider)
+ 	}
+ 	int real = 0;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	/* The PM6150 fuel gauge is sweet-only: other boards keep the static source. */
++	fReal = real == 1 && !a40_platform() && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 44f005f..87e9a13 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -61,7 +61,13 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
++# SWEET_BOARD=BLUEJAY (environment): Pixel 6a, Google Tensor = A55/A76/X1,
++# ARMv8.2 like the original sweet. Default: the A40 build (Cortex-A73, v8.0).
++ifeq ($(SWEET_BOARD),BLUEJAY)
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET -DSWEET_BOARD_BLUEJAY -march=armv8.2-a+crypto -mtune=cortex-a76
++else
+ MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a+crypto -mcpu=cortex-a73
++endif
+ 
+ 
+ #
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 29df9de..c9a4e89 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1843,15 +1843,17 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = SWEET_FB_PHYS | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	*slot = SWEET_FB_BLOCK | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++#if SWEET_HAS_DECON_TRIG
+ 	/* A40: DECON software trigger, Device memory, next slot */
+ 	assert(slot[1] == ARM_TTE_EMPTY);
+ 	slot[1] = SWEET_DECON_PHYS | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++#endif
+ 	__asm__ volatile("dsb ishst" ::: "memory");
+ }
+ #endif
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index f51cc75..0dcfcbd 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -297,10 +297,12 @@ LEXT(sweet_secondary_entry)
+ 	subs	x2, x2, #1
+ 	b.ne	1b
+ 	dsb		sy
++#if SWEET_HAS_DECON_TRIG
+ 	MOV64	x1, (SWEET_DECON_PHYS + SWEET_DECON_TRIG_OFF)
+ 	mov		w3, #SWEET_DECON_TRIG_VAL
+ 	str		w3, [x1]
+ 	dsb		sy
++#endif
+ 	mrs		x1, CurrentEL
+ 	cmp		x1, #0x4
+ 	b.eq	Lsweet_secondary_el1
+@@ -309,6 +311,11 @@ LEXT(sweet_secondary_entry)
+ 	adrp	x1, EXT(LowExceptionVectorBase)@page
+ 	add		x1, x1, EXT(LowExceptionVectorBase)@pageoff
+ 	msr		VBAR_EL2, x1
++	/* EL1 reads of MIDR/MPIDR return VPIDR/VMPIDR_EL2: make them the real ones. */
++	mrs		x1, MIDR_EL1
++	msr		VPIDR_EL2, x1
++	mrs		x1, MPIDR_EL1
++	msr		VMPIDR_EL2, x1
+ 	/* No stage 2, AArch64 EL1, no EL2 interrupt or FP/debug traps. */
+ 	mov		x1, #(1 << 31)
+ 	msr		HCR_EL2, x1
+@@ -542,10 +549,12 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++#if SWEET_HAS_DECON_TRIG
+ 	MOV64	x0, (SWEET_DECON_PHYS + SWEET_DECON_TRIG_OFF)
+ 	mov		w1, #SWEET_DECON_TRIG_VAL
+ 	str		w1, [x0]
+ 	dsb		sy
++#endif
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -702,13 +711,14 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, SWEET_FB_PHYS
++	MOV64	x10, SWEET_FB_BLOCK
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++#if SWEET_HAS_DECON_TRIG
+ 	/* A40: DECON (software trigger) as Device memory, V=P */
+ 	MOV64	x10, SWEET_DECON_PHYS
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+@@ -716,6 +726,7 @@ Lkernelcache_base_found:
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++#endif
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 3752157..44a8858 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -12,12 +12,18 @@
+ #include <kern/misc_protos.h>
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_FB_PHYS;
++#if SWEET_HAS_DECON_TRIG
+ static volatile uint32_t *early_trig = (volatile uint32_t *)(uintptr_t)(SWEET_DECON_PHYS + SWEET_DECON_TRIG_OFF);
++#endif
+ #define EARLY_FB early_fb
+ #define EARLY_WIDTH ((unsigned)SWEET_FB_W)
+ #define EARLY_HEIGHT ((unsigned)SWEET_FB_H)
+ #define EARLY_STRIDE ((unsigned)SWEET_FB_STRIDE / 4)
++#if SWEET_HAS_DECON_TRIG
+ #define EARLY_KICK() do { __asm__ volatile("dsb sy" ::: "memory"); *early_trig = SWEET_DECON_TRIG_VAL; } while (0)
++#else
++#define EARLY_KICK() __asm__ volatile("dsb sy" ::: "memory")
++#endif
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -132,9 +138,12 @@ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	/* base maps the 32 MB block holding the framebuffer (bluejay: not block aligned) */
++	early_fb = (volatile uint32_t *)(uintptr_t)(base + SWEET_FB_BLOCK_OFF);
++#if SWEET_HAS_DECON_TRIG
+ 	/* arm_vm_init maps the DECON block in the next 32 MB L2 slot */
+ 	early_trig = (volatile uint32_t *)(uintptr_t)(base + ARM_TT_L2_SIZE + SWEET_DECON_TRIG_OFF);
++#endif
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 9cdaf06..9fa1361 100644
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -869,6 +869,87 @@ fbcon_probe(void)
+ 	}
+ }
+ 
++/*
++ * sweet (Pixel 6a fork): polled, transmit-only UART described by the ADT node
++ * "sweet-uart" (reg = absolute physical address): "arm,pl011" under QEMU,
++ * "samsung,exynos4210-uart" for the Pixel 6a's USI serial_0 (32-bit access
++ * only). The firmware's line settings are kept. Used only with boot-arg
++ * sweetuart=1: a Samsung port that ABL left clock-gated can hang the bus, so
++ * the shim adds the flag only when ABL enabled the console.
++ */
++static volatile uint32_t *suart_base;
++static bool suart_samsung;
++
++static unsigned int
++suart_transmit_ready(void)
++{
++	if (suart_samsung) {
++		if (suart_base[0x08 / 4] & 1) {                 /* UFCON: FIFO on */
++			return !(suart_base[0x18 / 4] & (1u << 24));    /* UFSTAT TX full */
++		}
++		return (suart_base[0x10 / 4] & 2) != 0;         /* UTRSTAT TX empty */
++	}
++	return !(suart_base[0x18 / 4] & 0x20);                  /* PL011 FR.TXFF */
++}
++
++static void
++suart_transmit_data(uint8_t c)
++{
++	suart_base[(suart_samsung ? 0x20 : 0x00) / 4] = c;      /* UTXH / DR */
++}
++
++static unsigned int
++suart_receive_ready(void)
++{
++	return 0;
++}
++
++static uint8_t
++suart_receive_data(void)
++{
++	return 0;
++}
++
++static void
++suart_init(void)
++{
++	if (!suart_samsung) {
++		suart_base[0x30 / 4] |= 0x101;                  /* PL011 CR: UARTEN | TXE */
++	}
++}
++
++SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_uart_serial_functions =
++{
++	.init = suart_init,
++	.transmit_ready = suart_transmit_ready,
++	.transmit_data = suart_transmit_data,
++	.receive_ready = suart_receive_ready,
++	.receive_data = suart_receive_data,
++	.device = SERIAL_SWEET_UART
++};
++
++static void
++sweet_uart_probe(void)
++{
++	DTEntry entry;
++	uint64_t const *reg;
++	char const *compat;
++	unsigned int size, csize;
++	uint32_t enabled = 0;
++
++	if (!PE_parse_boot_argn("sweetuart", &enabled, sizeof(enabled)) || !enabled ||
++	    SecureDTFindEntry("name", "sweet-uart", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16 ||
++	    SecureDTGetProperty(entry, "compatible", (void const **)&compat, &csize) != kSuccess) {
++		return;
++	}
++	suart_samsung = strncmp(compat, "arm,pl011", csize) != 0;
++	suart_base = (volatile uint32_t *)ml_io_map(reg[0], reg[1]);
++	if (suart_base != NULL) {
++		register_serial_functions(&sweet_uart_serial_functions);
++	}
++}
++
+ #if HIBERNATION
+ /**
+  * Transitions the serial driver into a mode that can be run in the hibernation
+@@ -950,6 +1031,7 @@ serial_init(void)
+ 	PE_parse_boot_argn("disable-uart-irq", &disable_uart_irq, sizeof(disable_uart_irq));
+ 
+ 	fbcon_probe();
++	sweet_uart_probe();
+ 
+ #ifdef PI3_UART
+ 	if (SecureDTFindEntry("name", "gpio", &entryP) == kSuccess) {
+diff --git a/pexpert/pexpert/arm/protos.h b/pexpert/pexpert/arm/protos.h
+index bd7c615..1bb6df9 100644
+--- a/pexpert/pexpert/arm/protos.h
++++ b/pexpert/pexpert/arm/protos.h
+@@ -55,7 +55,8 @@ typedef enum serial_device {
+ 	SERIAL_PI3_UART=0x4,
+ 	SERIAL_VMAPPLE_UART=0x8,
+ 	SERIAL_DCC_UART=0x10,
+-	SERIAL_SWEET_FBCON=0x20
++	SERIAL_SWEET_FBCON=0x20,
++	SERIAL_SWEET_UART=0x40
+ } serial_device_t;
+ 
+ kern_return_t serial_irq_enable(serial_device_t device);
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b834ce7..0df1642 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -33,7 +33,10 @@
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+ #define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-/* A40: Cortex-A73 is ARMv8.0, no PAN */
++/* A40: Cortex-A73 is ARMv8.0, no PAN. Pixel 6a (Tensor, ARMv8.2) has it. */
++#if defined(SWEET_BOARD_BLUEJAY)
++#define __ARM_PAN_AVAILABLE__     1
++#endif
+ #define __ARM_16K_PG__            1
+ 
+ #define HAS_GIC_V3                1
+@@ -53,13 +56,32 @@
+  * the DECON software trigger the command-mode panel needs after each update.
+  * QEMU (tools/qemu-a40.py) keeps the same addresses as plain RAM / ignored MMIO.
+  */
++#if defined(SWEET_BOARD_BLUEJAY)
++/*
++ * Pixel 6a (bluejay, Google Tensor GS101): ABL's splash buffer, a8r8g8b8,
++ * kept scanning out by the DECON in video mode (no software trigger). Not
++ * 32 MB aligned: the early V=P / kernel-VA block maps SWEET_FB_BLOCK and the
++ * console adds SWEET_FB_BLOCK_OFF. QEMU (tools/qemu-bluejay.py) uses the
++ * same address as plain RAM. Virtual timer = INTID 27 (also in the ADT).
++ */
++#define SWEET_FB_PHYS             0xFAC00000ULL
++#define SWEET_FB_W                1080
++#define SWEET_FB_H                2400
++#define SWEET_FB_STRIDE           4320
++#define SWEET_HAS_DECON_TRIG      0
++#else
+ #define SWEET_FB_PHYS             0xEC000000ULL
+ #define SWEET_FB_W                1080
+ #define SWEET_FB_H                2340
+ #define SWEET_FB_STRIDE           4320
++#define SWEET_HAS_DECON_TRIG      1
+ #define SWEET_DECON_PHYS          0x14000000ULL   /* 32 MB block holding DECON (0x14860000) */
+ #define SWEET_DECON_TRIG_OFF      0x860070
+ #define SWEET_DECON_TRIG_VAL      0x1281
++#endif
++/* 32 MB (16K-granule L2) block holding the framebuffer, and the offset in it */
++#define SWEET_FB_BLOCK            (SWEET_FB_PHYS & ~0x1FFFFFFULL)
++#define SWEET_FB_BLOCK_OFF        (SWEET_FB_PHYS & 0x1FFFFFFULL)
+ 
+ #define SWEET_IPI_SGI             1       // SGI used for cross-CPU signals
+ 
