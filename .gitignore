@@ -16,3 +16,12 @@ ipsw/
 backup/
 dtb/
 .DS_Store
+factory/
+*.dmg
+*.cdr
+*.im4p
+*.bin
+*.raw
+
+# Kernel logs pulled from the phone or QEMU
+logs/
