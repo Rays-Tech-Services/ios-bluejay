@@ -42,8 +42,20 @@ Pixel ABL (unlocked) -- fastboot boot boot.img (header v4), enters at EL2
 
 ## QEMU
 
+**Just run it:**
+
 ```sh
-brew install qemu            # or: apt install qemu-system-arm
+brew install qemu
+./run-qemu.sh                       # kernel from out/ci/ (unzip the xnu-kernel-bluejay CI artifact there)
+./run-qemu.sh --disk disk.img       # with a real iOS root (see below)
+./run-qemu.sh --diag                # only the shim's diagnostic screen
+```
+
+The kernel log scrolls in the terminal, and the phone screen opens in your browser (`out/run/screen.html`, refreshed every few seconds). Ctrl-C stops it; the last screen stays in `out/run/fb.png` and `fb.txt`. Without `--disk` the root is empty, so the boot ends at `exec of /sbin/launchd failed`.
+
+**Tests and details:**
+
+```sh
 tools/qemu-smoke.sh          # ~5 min; uses the A40 port's prebuilt kernel until the bluejay one is built
 tools/qemu-smoke.sh kernel.development.sweet   # with the bluejay kernel from CI
 ```

@@ -255,7 +255,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('image', nargs='?')
     ap.add_argument('outdir', nargs='?')
-    ap.add_argument('--secs', type=float, default=30)
+    ap.add_argument('--secs', type=float, default=30, help='run time; 0 = until Ctrl-C')
+    ap.add_argument('--live', action='store_true', help='stream serial.txt (shim + kernel log) to this terminal')
     ap.add_argument('--disk', help='raw root disk (GPT with a "userdata" partition) as virtio-blk')
     ap.add_argument('--snapshot', action='store_true', help='do not write to --disk')
     ap.add_argument('--el1', action='store_true', help='enter at EL1 instead of EL2')
@@ -336,20 +337,40 @@ def main():
     print(f'QEMU: {ram_gib} GiB, entry {"EL1" if a.el1 else "EL2"}, Image at {IMAGE_PA:#x}, DTB at {DTB_PA:#x}'
           + (f', initrd {initrd[0]:#x}-{initrd[1]:#x}' if initrd else ''), file=sys.stderr)
 
-    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+    # Stop cleanly (save the screen, kill QEMU) on Ctrl-C or kill, even when
+    # started from a shell that ignores SIGINT for background jobs.
+    import signal
+
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    # own session: Ctrl-C reaches only this script, which then saves the screen
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, start_new_session=True)
     try:
         if a.gdb:
             print('gdb stub on :1234 (target remote :1234)', file=sys.stderr)
             p.wait()
             return 0
         t0 = last = time.time()
-        while p.poll() is None and time.time() - t0 < a.secs:
-            time.sleep(0.25)
-            if a.watch and time.time() - last >= a.watch and os.path.exists(mon):
-                last = time.time()
-                qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
-                if os.path.exists(f'{out}/fb.raw'):
-                    write_png(f'{out}/fb.png', open(f'{out}/fb.raw', 'rb').read())
+        pos = 0
+        try:
+            while p.poll() is None and (a.secs <= 0 or time.time() - t0 < a.secs):
+                time.sleep(0.25)
+                if a.live and os.path.exists(f'{out}/serial.txt'):
+                    with open(f'{out}/serial.txt', 'rb') as sf:
+                        sf.seek(pos)
+                        chunk = sf.read()
+                    pos += len(chunk)
+                    sys.stdout.write(chunk.decode(errors='replace'))
+                    sys.stdout.flush()
+                if a.watch and time.time() - last >= a.watch and os.path.exists(mon):
+                    last = time.time()
+                    qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
+                    if os.path.exists(f'{out}/fb.raw'):
+                        write_png(f'{out}/fb.png', open(f'{out}/fb.raw', 'rb').read())
+        except KeyboardInterrupt:
+            print('\nCtrl-C: saving the screen and stopping QEMU', file=sys.stderr)
         result = {'status': 'qemu_exited', 'qemu_returncode': p.returncode}
         if p.poll() is None:
             regs, *extra = qmp(mon, 'info registers', *a.hmp, stop=True,
