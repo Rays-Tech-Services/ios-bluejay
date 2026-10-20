@@ -25,6 +25,8 @@ The shim draws one screen and then refreshes the button state forever. Take a ph
 | `CNTFRQ` | `0x01770000` (24.576 MHz) | if it differs, change `TIMEBASE` in `tools/mkadt.py` |
 | `memory` | a range covering `0x880000000` + 3.5 GiB, and **no** `reserved ... overlaps` line in red | move `PHYS_BASE`/`MEM_SIZE` in `mkadt.py` and `shim/board.h` |
 | `framebuffer` | `0xfac00000`. If the screen is black, the splash buffer is elsewhere | look for any address the FDT reports; if none, find the DECON window base. Set `FB` in `mkadt.py`, `board.h` and `SWEET_FB_PHYS` in the kernel patch |
+| `DECON GLOBAL_CON / TRIG_CON` | `command mode, TE trigger unmasked` (or `TE trigger unmasked, TRIG_CON now ...`: the shim fixed it) or `video mode` | `SOFTWARE trigger`: the panel needs a kick per frame; add a `trigger` property to `sweet-fbcon` in `mkadt.py` |
+| `touch` | `chip id (dummy, 36 48 ...)`, then `FTM5 answers; scanning on`; touching the screen changes `touch x/y` (0–1079, 0–2399) | `no FTM5 answer`: ABL left the touch supplies (PMIC LDO25M/26M) off. The kernel then needs PMIC access over ACPM (not written yet) |
 | `watchdogs` | WTCON values; `was` with bit 5 set means ABL left one running | (the shim stops it either way) |
 | `UFS` | `HCE 0x00000001`, `HCS` with bits 0–3 set, `DBR 0` | if HCE is 0, ABL shuts UFS down: the kernel needs a full Exynos UFS bring-up (not written) |
 | `UFS vs TXPRDT/RXPRDT` | `0x0000000c` (4 KiB segments) | other values are fine; the driver always uses 4 KiB |
@@ -82,6 +84,6 @@ First boot = fixer boot: append `launchdsuffix=a40fix` to the command line in st
 
 ## Known gaps
 
-* **Touch** is not ported (Goodix over SPI on the 6a). Until then the phone shows the lock screen but cannot be unlocked by touch.
+* **Touch** is written (ST FTM5, `bsd/dev/bluejay_touch.c`) but depends on ABL leaving the touch supplies on; step 1 tells. If they are off, switching them on needs the PMIC's ACPM mailbox protocol (not written).
 * **No log reader**: there is no TWRP for the 6a, so the persistent log at the end of `userdata` can't be pulled the way sweet and the A40 do it. Use the screen and the UART.
 * GPU, Wi-Fi, cellular, audio, cameras, USB, battery readout, power management: none.

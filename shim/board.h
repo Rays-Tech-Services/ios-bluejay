@@ -47,3 +47,14 @@ static inline int key_bit(int k)
 #define TS_GPP23		(PERIC1_PINCTRL + 0x60)	/* CON +0, DAT +4, PUD +8 */
 #define TS_GPP26		(PERIC1_PINCTRL + 0xc0)
 #define TS_GPA9_DAT		(0x174d0000UL + 0xc0 + 4)
+
+/*
+ * Display: DECON0 main registers (gs101-drm-dpu.dtsi), from Google's
+ * display/samsung/cal_9845/regs-decon.h. In command mode with hardware
+ * (TE) triggering, Linux unmasks the trigger per frame and masks it again
+ * afterwards; left masked, the panel never shows new framebuffer contents.
+ */
+#define DECON0			0x1C300000UL
+#define DECON_GLOBAL_CON	0x20		/* bit 8: command mode, bits 0/1: enable */
+#define DECON_TRIG_CON		0x30		/* bit 0 HW_TRIG_EN, 4 HW_TRIG_MASK_DECON, 8 SW_TRIG_EN */
+#define DECON_SHD_REG_UP_REQ	0x50		/* bit 31: global shadow update */

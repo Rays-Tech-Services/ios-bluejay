@@ -690,6 +690,55 @@ static void watchdogs_off(u64 dtb, int verbose)
 	}
 }
 
+/*
+ * GS101 DECON0: report its mode and, in command mode with a masked hardware
+ * trigger, unmask it so every TE pulse sends the framebuffer to the panel
+ * (continuous refresh). Only when the live tree has the DECON at DECON0.
+ */
+static int fdt_has_decon(u64 dtb)
+{
+	struct fdt f;
+	fdt_begin(&f, dtb);
+	while (fdt_next(&f)) {
+		u64 a, s;
+		if (prop_is(&f, "compatible") && contains((const char *)f.val, f.len, "exynos-decon") &&
+		    node_reg(&f, 0, &a, &s) && a == DECON0)
+			return 1;
+	}
+	return 0;
+}
+
+static void decon_refresh(u64 dtb, int fix)
+{
+	if (!fdt_has_decon(dtb)) {
+		if (fix < 0)
+			say(C_DIM, "  no GS101 DECON in the device tree");
+		return;
+	}
+	u32 g = rd32(DECON0 + DECON_GLOBAL_CON), t = rd32(DECON0 + DECON_TRIG_CON);
+	kv2("  DECON GLOBAL_CON ", g, " TRIG_CON ", t);
+	int cmd = (g >> 8) & 1, on = g & 3, sw = (t >> 8) & 1;
+	if (!on || !cmd) {
+		say(C_DIM, on ? "  video mode: refreshes by itself" : "  DECON off?");
+		return;
+	}
+	if (sw) {
+		say(C_WARN, "  command mode, SOFTWARE trigger: needs a kick per frame");
+		return;
+	}
+	if ((t & 1) && !(t & 0x10)) {
+		say(C_OK, "  command mode, TE trigger unmasked: refreshes by itself");
+		return;
+	}
+	if (!fix) {
+		say(C_WARN, "  command mode, TE trigger masked (not changed)");
+		return;
+	}
+	wr32(DECON0 + DECON_SHD_REG_UP_REQ, 1u << 31);
+	wr32(DECON0 + DECON_TRIG_CON, (t & ~0x10u) | 1u);
+	kv("  TE trigger unmasked, TRIG_CON now ", rd32(DECON0 + DECON_TRIG_CON));
+}
+
 /* PL011 always (QEMU); the phone's Samsung UART only when ABL enabled it. */
 static void uart_setup(u64 dtb, const struct payload *p)
 {
@@ -875,6 +924,7 @@ static void __attribute__((noreturn)) diag(u64 dtb)
 	say(check_memory(dtb, BLUEJAY_PHYS_BASE, BLUEJAY_MEM_SIZE, 1) ? C_OK : C_ERR, "  -> memory check done");
 	say(C_DIM, "framebuffer:");
 	fdt_framebuffer(dtb, 1);
+	decon_refresh(dtb, -1);
 	say(C_DIM, "watchdogs:");
 	watchdogs_off(dtb, 1);
 	say(C_DIM, "UFS (ABL must leave the link up):");
@@ -978,6 +1028,9 @@ __attribute__((used)) void shim_main(u64 dtb, u64 base, u64 entry_el)
 	kv("FDT ", dtb);
 	if (!have_fdt)
 		halt("no flattened device tree in x0");
+	/* Make the panel show what we draw (command-mode DECON, see board.h). */
+	if (!payload_flag(p, "shimdecon=0"))
+		decon_refresh(dtb, 1);
 	if (uart_kind == UART_PL011)
 		kv("UART pl011 ", uart_base);
 	else if (uart_kind == UART_SAMSUNG)
