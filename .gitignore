@@ -1,0 +1,18 @@
+# Upstream projects (separate git repos)
+/ios-sweet/
+/iOS16-on-A40/
+
+# Patched XNU tree and build outputs
+/build/
+out/
+__pycache__/
+
+# Apple artifacts and device dumps never go in git
+ipsw/
+*.ipsw
+*.adt
+*.img
+*.simg
+backup/
+dtb/
+.DS_Store
