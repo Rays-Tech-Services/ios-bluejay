@@ -44,6 +44,18 @@ fi
 if [ -n "$(git status --porcelain)" ]; then
 	echo "Note: you have uncommitted changes; only committed work is pushed."
 fi
+# If the repo was created with a README/licence, GitHub already has a commit:
+# merge it in (no force push, nothing on GitHub is overwritten).
+if git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+	git fetch origin main
+	if ! git merge-base --is-ancestor origin/main main; then
+		echo "GitHub's main has commits this repo lacks (e.g. an initial README); merging them."
+		git merge --no-edit --allow-unrelated-histories origin/main || {
+			echo "Merge conflict: fix the files listed above, 'git commit', then run this script again."
+			exit 1
+		}
+	fi
+fi
 git push -u origin main
 
 echo
