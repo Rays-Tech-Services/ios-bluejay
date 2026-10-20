@@ -317,7 +317,8 @@ def main():
     mon = f'{out}/mon.sock'
     if os.path.exists(mon):
         os.unlink(mon)
-    machine = 'virt,gic-version=3,its=off,highmem=on' + ('' if a.el1 else ',virtualization=on')
+    # acpi=off: system_powerdown then pulses the PL061 power-key GPIO the ADT polls
+    machine = 'virt,gic-version=3,its=off,highmem=on,acpi=off' + ('' if a.el1 else ',virtualization=on')
     cmd = [qemu, '-M', machine, '-cpu', a.cpu, '-smp', str(a.smp), '-m', f'{ram_gib}G',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-monitor', 'none',
            '-qmp', f'unix:{mon},server,nowait', '-no-reboot',

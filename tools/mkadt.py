@@ -73,6 +73,9 @@ QEMU_GICD, QEMU_GICR, QEMU_GICR_SIZE = 0x08000000, 0x080a0000, 0x100000
 QEMU_TIMEBASE = 62500000                     # cortex-a76 under TCG
 QEMU_UART = 0x09000000
 QEMU_VIRTIO, QEMU_VIRTIO_SIZE = 0x0a000000, 0x4000
+# virt's PL061 GPIO (needs -M virt,acpi=off): `system_powerdown` in the QEMU
+# monitor pulses pin 3 high for ~100 ms -> our power key (tools/qemu-key.py).
+QEMU_PL061_DATA = 0x09030000 + 0x3fc        # GPIODATA, all pins unmasked
 
 ECID = 0x50363661_00000001                  # 'P66a' + 1, synthetic
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
@@ -232,9 +235,10 @@ def build(seed=None, qemu=False):
 
     # bsd/dev/a40_keys.c generic path: <u64 DAT register PA, u32 bit, u32 key>,
     # active low. Bit 31 of the bit field would mark an active-high input.
-    keys = [] if qemu else [node('gpio-keys', [
+    key_table = [(QEMU_PL061_DATA, 3 | 1 << 31, KEY_POWER)] if qemu else KEYS
+    keys = [node('gpio-keys', [
         ph(),
-        ('keys', b''.join(struct.pack('<QII', pa, bit, key) for pa, bit, key in KEYS)),
+        ('keys', b''.join(struct.pack('<QII', pa, bit, key) for pa, bit, key in key_table)),
     ])]
 
     # bsd/dev/bluejay_touch.c: ST FTM5 on spi_11, bit-banged on its GPIOs
