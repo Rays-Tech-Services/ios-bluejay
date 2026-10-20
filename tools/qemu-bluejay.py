@@ -114,7 +114,9 @@ def pixel_like_fdt(high_size, bootargs, initrd=None, smp=1):
 
     f.begin(f'memory@{LOW_BASE:x}')
     f.prop('device_type', 'memory')
-    f.prop('reg', q(LOW_BASE, LOW_SIZE, HIGH_BASE, high_size))
+    # like Pixel ABL: the upper bank as adjacent 2 GiB ranges (out of order)
+    hi = [(HIGH_BASE + o, min(1 << 31, high_size - o)) for o in range(0, high_size, 1 << 31)]
+    f.prop('reg', q(*[v for r in reversed(hi) for v in r], LOW_BASE, LOW_SIZE))
     f.end()
 
     # Firmware carve-outs live in the low bank on GS101; a few stand-ins so the

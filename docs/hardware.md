@@ -68,3 +68,20 @@ Nothing in this file has been tested on a real Pixel 6a yet.
 
 * `fastboot boot` of an Android boot image **v4** (header + kernel + generic ramdisk). ABL adds the flashed `vendor_boot` ramdisk *in front of* our ramdisk, so the XNU payload is embedded in the kernel `Image` itself (offset/size in the Image header, as the A40 loader does); the initrd is also searched as a fallback.
 * `os_version` / `os_patch_level`: copy them from your stock `boot.img` (`--like`). **Do not invent a future patch level**: the Titan M2's KeyMint remembers the highest one it saw, and Android would then refuse to start with older keys.
+
+## Measured on a Pixel 6a (2026-10-20, diagnostic boot, Android 17 CP3A.261005.002.A1 bootloader 17.0-15681480)
+
+| What | Value | Meaning |
+| --- | --- | --- |
+| Entry | EL2 → EL1, MIDR `0x412fd050` (Cortex-A55 r2p0), MPIDR `0x81000000` | as expected |
+| CNTFRQ | `0x01770000` = 24.576 MHz | firmware does program it |
+| Image / FDT | loaded at `0x80000000`, FDT at `0xb4000000` | |
+| /memory | `0x80000000`+2 GiB, `0x880000000`+2 GiB, `0x900000000`+2 GiB (upper bank as two adjacent ranges) | XNU's `0x880000000`+3.5 GiB is free; no reserved region above 4 GiB |
+| DECON0 | `GLOBAL_CON 0x133` = **command mode**, `TRIG_CON 0x3070` = TE trigger **masked** | ABL masks the trigger: the shim's unmask (`0x3061`) is what makes the panel show our drawing |
+| Framebuffer | drawing at `0xfac00000` is visible | address confirmed |
+| Watchdogs | `0x10060000` WTCON `0x1af39`, `0x10070000` WTCON `0x18021`: **both running** | the shim stops them (otherwise a reset a few seconds in) |
+| UFS | CAP `0x1303ff1f` (64AS set), VER `0x300`, HCS `0x10f`, HCE 1, DBR 0, TX/RXPRDT `0xc` | link left up: takeover works as designed |
+| UFS nexus | `UTRL_NEXUS 0xfffffffe`: **slot 0's bit is clear** | the kernel sets it before using slot 0 |
+| Keys (idle) | power `0x2`, vol+ `0x6`, vol- `0xc` (all "up") | addresses plausible; press test pending |
+| Touch | GPP23 pins 0–3 left as inputs, TS_RESET_L low, GPA9 int low, chip id `00 00`... | ABL leaves the FTM5 unpowered / in reset: its supplies (PMIC LDO25M/26M) must be switched on |
+| ABL bootargs | no `ttySAC`/`earlycon` | UART not enabled (shim stays off it) |

@@ -586,7 +586,8 @@ static int overlaps(u64 a, u64 as, u64 b, u64 bs)
 static int check_memory(u64 dtb, u64 base, u64 size, int verbose)
 {
 	struct fdt f;
-	int inside = 0, bad = 0;
+	int inside = 0, bad = 0, nmem = 0;
+	u64 mem_a[16], mem_s[16];
 	fdt_begin(&f, dtb);
 	while (fdt_next(&f)) {
 		if (!prop_is(&f, "reg"))
@@ -598,8 +599,10 @@ static int check_memory(u64 dtb, u64 base, u64 size, int verbose)
 					break;
 				if (verbose)
 					kv2("  memory ", a, " size ", s);
-				if (a <= base && base + size <= a + s)
-					inside = 1;
+				if (nmem < 16) {
+					mem_a[nmem] = a;
+					mem_s[nmem++] = s;
+				}
 			}
 		} else if (f.depth == 3 && str_eq(node_name(&f, 2), "reserved-memory")) {
 			for (int i = 0; i < 8; i++) {
@@ -635,8 +638,15 @@ static int check_memory(u64 dtb, u64 base, u64 size, int verbose)
 			bad = 1;
 		}
 	}
+	/* Pixel ABL lists the upper bank as adjacent 2 GiB ranges: walk across them. */
+	u64 end = base;
+	for (int pass = 0; pass < nmem && end < base + size; pass++)
+		for (int i = 0; i < nmem; i++)
+			if (mem_a[i] <= end && end < mem_a[i] + mem_s[i])
+				end = mem_a[i] + mem_s[i];
+	inside = end >= base + size;
 	if (!inside)
-		say(C_ERR, "  XNU RAM is not inside any /memory range");
+		say(C_ERR, "  XNU RAM is not inside the /memory ranges");
 	return inside && !bad;
 }
 
