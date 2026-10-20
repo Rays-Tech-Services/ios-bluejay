@@ -2,7 +2,7 @@
 
 A port of [ios-sweet](https://github.com/dipa-studio/ios-sweet) (iOS 16 on the Redmi Note 10 Pro) and [iOS16-on-A40](https://github.com/tlfares/iOS16-on-A40) (the same on the Galaxy A40) to the **Google Pixel 6a** (`bluejay`, Google Tensor / GS101), plus a **QEMU setup** that runs the Pixel boot chain on a Mac or Linux PC.
 
-> **Status (2026-10-20): not yet run on a Pixel 6a.** The boot shim, device tree, payload and boot image tooling run under QEMU, and an existing XNU build boots through them to `exec /sbin/launchd`. The bluejay kernel patch applies cleanly but has **not been compiled** yet (it needs the macOS CI build below). The hardware facts it relies on come from mainline Linux and the Pixel 6 device tree; the ones not measured on a 6a are marked **VERIFY** in [docs/hardware.md](docs/hardware.md), and the shim's diagnostic boot checks each of them.
+> **Status (2026-10-20): not yet run on a Pixel 6a.** The bluejay kernel builds on GitHub Actions (`xnu-bluejay` workflow, run 39490131821) and boots in QEMU through the real shim: EL2 entry, GICv3 timer (INTID 27), framebuffer driver at `0xfac00000`, kernel log on the serial console, virtio disk, HFS+ `userdata` root, then `exec /sbin/launchd` (`tools/qemu-smoke.sh` passes). Nothing Pixel-specific below the shim has run on hardware: the hardware facts come from mainline Linux and the Pixel 6 device tree, the ones not measured on a 6a are marked **VERIFY** in [docs/hardware.md](docs/hardware.md), and the shim's diagnostic boot checks each of them.
 
 ## Why the Pixel 6a is a good target
 
