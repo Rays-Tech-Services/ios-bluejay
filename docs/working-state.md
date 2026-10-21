@@ -53,5 +53,7 @@ User requested both. See `docs/network-battery.md`. Diagnostic built at
 `out/phone-power-usb/boot.img`; QEMU skips hardware correctly. Awaiting user
 fastboot readiness before temporary diagnostic boot; give advance notice.
 Kernel source now has opt-in sweetbattery=2 and sweetusb=2 Pixel paths.
-Decoder tests pass; full CI and all phone verification still pending.
+Decoder tests pass; CI run 39532556491 is building commit 3bf96f0.
+https://github.com/Rays-Tech-Services/ios-bluejay/actions/runs/39532556491
+All phone verification for these features is still pending.
 No installed boot partition or userdata changes made for this work.

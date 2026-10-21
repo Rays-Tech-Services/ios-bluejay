@@ -33,6 +33,16 @@ Battery I2C uses GPP23 pins 4/5; touch SPI uses pins 0..3 on the same register
 bank. A shared mutex protects bank RMW operations and battery mux restoration.
 Hardware tests must confirm touch remains responsive during polling.
 
+## Mac local-link helper
+
+`python3 tools/pixel-usb-macos.py` only reports whether the matching CDC-ECM
+interface exists. `--configure-link` rechecks its exact host MAC, then uses sudo
+to assign 192.168.7.1/24 to that interface and ping the phone. `--listen` receives
+UDP kernel logs after the local link is configured. This does not enable NAT,
+forwarding or DNS and does not modify unrelated network interfaces.
+Interface-selection tests pass; current Mac inspection found no Pixel ECM
+interface yet, as expected before booting the experimental USB driver.
+
 ## Network milestones still required
 
 1. Read inherited controller ID and state on the phone.
