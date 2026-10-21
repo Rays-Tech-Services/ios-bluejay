@@ -105,3 +105,22 @@ must display those as layer contents, which is unverified. If the page renders,
 QuartzCore's IOSurface CG queue is the culprit; if it stays blank, WebKit's
 painting itself is not reaching any buffer. Host check: `tools/surface-format-test.cpp`.
 Test without sweetweb_bgra (it is irrelevant once WebKit surfaces are refused).
+
+## Result: fixed on the phone (2026-10-21)
+
+Kernel CI 39550812835 (4a91c55), SHA256
+`1881bc371da9af91eaf841a9cdc0cea0a803e9af9788ba7e3de4a3ec3a24297d`. Temporary
+image `out/phone-ios-webkit-cpu/boot.img`, SHA256
+`129acec5613839953336241217f78d278a553a81df8c859e085143be66494129`: the trace
+image's command line with `sweetweb_bgra=1` replaced by `sweetweb_cpu=1`. QEMU
+smoke passed through launchd exec. After a `fastboot boot`, the user confirms
+Safari displays the local test page. The log (`out/webkit-cpu-phone.log`)
+shows the WebKit GPU process's w30r/b3a8 tile requests refused, and the
+test server logged `GET /` from 192.168.2.2. The only crashes, driverkitd and
+PosterBoard, also occur on the previous two boots. Not yet tested: external
+sites, scrolling, images, canvas and video, plus how fast pages render. Installed boot unchanged:
+the fix exists only in the temporary image.
+
+Root cause, as narrowed down: QuartzCore's IOSurface CG context path (used only
+by WebKit here) produces no pixels without Metal. Why its software fallback
+stays blank for BGRA was not determined; the CPU bitmap path avoids it.
