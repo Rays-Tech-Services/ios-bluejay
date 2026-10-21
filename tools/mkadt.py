@@ -6,7 +6,11 @@ Google Pixel 6a: Google Tensor (GS101, Exynos-derived): 4 x Cortex-A55,
 (GICv3); Exynos UFS host; Samsung (USI) UART; 1080x2400 panel scanned out
 from the splash buffer ABL leaves at 0xfac00000.
 
-  mkadt.py OUT.adt [--qemu] [--dump] [--x2]
+  mkadt.py OUT.adt [--qemu] [--dump] [--x2] [--seed-from=OLD.adt]
+
+--x2 presents 828x1792 @2x (boot with sweetfb_lw=828 sweetfb_lh=1792).
+--seed-from keeps another ADT's /chosen random-seed, so only intended
+properties differ from an image already in use.
 
 --qemu: the same kernel on QEMU virt (gic-version=3, PL011, virtio-mmio
 block device instead of UFS); see tools/qemu-bluejay.py.
@@ -132,7 +136,8 @@ def build(seed=None, qemu=False):
         ('system-firmware-version', cstr('bluejay-shim')),
         ('boot-manifest-hash', BOOT_MANIFEST_HASH),
         ('crypto-hash-method', cstr('sha2-384')),
-        ('display-scale', u32(3)),
+        # 2 with --x2: 828x1792 px = 414x896 points, like the iPhone XR.
+        ('display-scale', u32(3 if CANVAS == (1125, 2436) else 2)),
         ('unique-chip-id', struct.pack('<Q', ECID)),
         ('chip-id', u32(0x8015)),
         ('certificate-production-status', u32(0)),
@@ -286,7 +291,12 @@ if __name__ == '__main__':
         raise SystemExit(__doc__)
     if '--x2' in sys.argv:
         CANVAS = (828, 1792)
-    blob = adt.serialize(build(qemu='--qemu' in sys.argv))
+    seed = None
+    for a in sys.argv:
+        if a.startswith('--seed-from='):
+            old = adt.parse(open(a.split('=', 1)[1], 'rb').read())[0]
+            seed = next(c for c in old.children if c.name == 'chosen').prop('random-seed')
+    blob = adt.serialize(build(seed=seed, qemu='--qemu' in sys.argv))
     open(args[0], 'wb').write(blob)
     if '--dump' in sys.argv:
         adt.dump(adt.parse(blob)[0])
