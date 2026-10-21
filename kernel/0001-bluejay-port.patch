@@ -636,7 +636,7 @@ index 53e5095..6d5def7 100644
  probed:
  	lck_mtx_unlock(&sweet_ufs_lock);
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index b6c1a41..58ae9dc 100644
+index b6c1a41..99263d6 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -21,6 +21,7 @@
@@ -647,7 +647,15 @@ index b6c1a41..58ae9dc 100644
  #include <kern/locks.h>
  #include <sys/kpi_mbuf.h>
  #include <sys/kpi_socket.h>
-@@ -82,7 +83,31 @@ sweet_usb_probe(void)
+@@ -34,6 +35,7 @@
+ #include <net/kpi_protocol.h>
+ #include <netinet/in.h>
+ #include <net/if_media.h>
++#include <net/bpf.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
+ 
+@@ -82,7 +84,31 @@ sweet_usb_probe(void)
  
  	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
  	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
@@ -680,7 +688,7 @@ index b6c1a41..58ae9dc 100644
  		return;
  	}
  	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
-@@ -181,6 +206,7 @@ sweet_usb_probe(void)
+@@ -181,6 +207,7 @@ sweet_usb_probe(void)
  #define DEPCMD_SETEPCONFIG      1
  #define DEPCMD_SETTRANSFRESOURCE 2
  #define DEPCMD_SETSTALL         4
@@ -688,7 +696,7 @@ index b6c1a41..58ae9dc 100644
  #define DEPCMD_STARTTRANSFER    6
  #define DEPCMD_DEPSTARTCFG      9
  #define DEPCMD_CMDACT           (1u << 10)
-@@ -225,6 +251,8 @@ static struct {
+@@ -225,6 +252,8 @@ static struct {
  	uint32_t    evt_pos;
  	int         sleep_chan;
  	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
@@ -697,7 +705,7 @@ index b6c1a41..58ae9dc 100644
  	bool        data_in;        /* data stage direction */
  	uint32_t    events;
  	bool        configured;
-@@ -281,6 +309,8 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+@@ -281,6 +310,8 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
  				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
  				return -1;
  			}
@@ -706,7 +714,7 @@ index b6c1a41..58ae9dc 100644
  			return 0;
  		}
  		delay(1);
-@@ -460,6 +490,8 @@ ud_setup(void)
+@@ -460,6 +491,8 @@ ud_setup(void)
  			if (value == 1 && ud.configured) {
  				ud_notify_connected();
  				ud_link_event(true);
@@ -715,7 +723,17 @@ index b6c1a41..58ae9dc 100644
  			}
  		}
  	} else if (req == 10) {         /* GET_INTERFACE */
-@@ -536,7 +568,7 @@ ud_rx_done(void)
+@@ -521,6 +554,9 @@ ud_rx_done(void)
+ 			mbuf_pkthdr_setheader(m, frame_header);
+ 			mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
+ 			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++			/* IPConfiguration receives DHCP/ARP through BPF, before DLIL
++			 * consumes the mbuf. Header was stripped from its data above. */
++			bpf_tap_in(ud.ifp, DLT_EN10MB, m, frame_header, ETHER_HDR_LEN);
+ 			stats.packets_in = 1;
+ 			stats.bytes_in = len;
+ 			ud.rx_frames++;
+@@ -536,7 +572,7 @@ ud_rx_done(void)
  static void
  ud_tx_kick_locked(void)
  {
@@ -724,7 +742,15 @@ index b6c1a41..58ae9dc 100644
  		mbuf_t m = ud.txq[ud.txq_head];
  		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
  		ud.txq_count--;
-@@ -562,7 +594,7 @@ static errno_t
+@@ -545,6 +581,7 @@ ud_tx_kick_locked(void)
+ 			mbuf_freem(m);
+ 			continue;
+ 		}
++		bpf_tap_out(ud.ifp, DLT_EN10MB, m, NULL, 0);
+ 		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
+ 		mbuf_freem(m);
+ 		/* A frame of a multiple of 512 bytes would need a zero-length
+@@ -562,7 +599,7 @@ static errno_t
  ud_if_output(ifnet_t ifp, mbuf_t m)
  {
  	lck_mtx_lock(ud.lock);
@@ -733,7 +759,7 @@ index b6c1a41..58ae9dc 100644
  		lck_mtx_unlock(ud.lock);
  		mbuf_freem(m);
  		ifnet_stat_increment_out(ifp, 0, 0, 1);
-@@ -584,6 +616,8 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+@@ -584,6 +621,8 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
  static void
  ud_link_event(bool up)
  {
@@ -742,7 +768,7 @@ index b6c1a41..58ae9dc 100644
  	if (ud.ifp != NULL) {
  		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
  	}
-@@ -601,9 +635,9 @@ ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+@@ -601,9 +640,9 @@ ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
  		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
  		int media = IFM_ETHER | IFM_AUTO;
  		ifmr->ifm_current = media;
@@ -754,7 +780,7 @@ index b6c1a41..58ae9dc 100644
  		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
  			ifmr->ifm_count = 1;
  			return copyout(&media, list, sizeof(media));
-@@ -645,7 +679,7 @@ ud_if_create(void)
+@@ -645,7 +684,7 @@ ud_if_create(void)
  	init.flags = IFNET_INIT_LEGACY;
  	init.uniqueid = "sweet-usb-ecm";
  	init.uniqueid_len = sizeof("sweet-usb-ecm") - 1;
@@ -763,7 +789,17 @@ index b6c1a41..58ae9dc 100644
  	init.unit = 0;
  	init.family = IFNET_FAMILY_ETHERNET;
  	init.type = IFT_ETHER;
-@@ -684,7 +718,7 @@ ud_if_create(void)
+@@ -675,6 +714,9 @@ ud_if_create(void)
+ 		return;
+ 	}
+ 	ifnet_set_lladdr(ud.ifp, ud_phone_mac, ETHER_ADDR_LEN);
++	/* Without attachment BIOCSETIF cannot bind, so iOS cannot probe ARP
++	 * or receive DHCP even though in-kernel IP and ICMP work. */
++	bpfattach(ud.ifp, DLT_EN10MB, ETHER_HDR_LEN);
+ 
+ 	errno_t err = proto_plumb(PF_INET, ud.ifp);
+ 	socket_t so = NULL;
+@@ -684,7 +726,7 @@ ud_if_create(void)
  	if (err == 0) {
  		struct ifaliasreq ifra;
  		bzero(&ifra, sizeof(ifra));
@@ -772,7 +808,7 @@ index b6c1a41..58ae9dc 100644
  		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
  		a->sin_len = sizeof(*a);
  		a->sin_family = AF_INET;
-@@ -701,7 +735,44 @@ ud_if_create(void)
+@@ -701,7 +743,44 @@ ud_if_create(void)
  		sock_close(so);
  	}
  	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
@@ -818,7 +854,7 @@ index b6c1a41..58ae9dc 100644
  }
  
  static void
-@@ -710,6 +781,7 @@ ud_event(uint32_t ev)
+@@ -710,6 +789,7 @@ ud_event(uint32_t ev)
  	if (ev & 1) {                   /* device event */
  		uint32_t type = (ev >> 8) & 0xf;
  		if (type == 1) {        /* USB reset */
@@ -826,7 +862,7 @@ index b6c1a41..58ae9dc 100644
  			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
  			printf("SWEET USB: bus reset\n");
  		} else if (type == 2) { /* connect done */
-@@ -721,6 +793,7 @@ ud_event(uint32_t ev)
+@@ -721,6 +801,7 @@ ud_event(uint32_t ev)
  			    (1u << 8) | (1u << 10) | (1u << 25), 0);
  			printf("SWEET USB: connected, speed %u\n", speed);
  		} else if (type == 0) {
@@ -834,7 +870,38 @@ index b6c1a41..58ae9dc 100644
  			printf("SWEET USB: disconnect\n");
  		}
  		return;
-@@ -854,6 +927,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -823,7 +904,9 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	to.sin_len = sizeof(to);
+ 	to.sin_family = AF_INET;
+ 	to.sin_port = htons(5140);
+-	to.sin_addr.s_addr = htonl(0xc0a80701);         /* 192.168.7.1 */
++	uint32_t log_ip = 0xc0a80701;                 /* default 192.168.7.1 */
++	PE_parse_boot_argn("sweetusblogip", &log_ip, sizeof(log_ip));
++	to.sin_addr.s_addr = htonl(log_ip);
+ 	for (;;) {
+ 		ud_sleep_ms(100);
+ 		if (!ud.configured) {
+@@ -834,6 +917,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			continue;
+ 		}
+ 		uint32_t n;
++		uint64_t before = pos;
+ 		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+@@ -842,8 +926,10 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			};
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
++				pos = before;  /* Retain data until DHCP/route becomes ready. */
++				break;
+ 			}
++			before = pos;
+ 		}
+ 	}
+ }
+@@ -854,6 +940,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	thread_t thread;
  
  	ud.dwc = dwc;
@@ -843,7 +910,7 @@ index b6c1a41..58ae9dc 100644
  	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
  	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
  		printf("SWEET USB: no DMA memory\n");
-@@ -884,6 +959,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -884,6 +972,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
  	ud.evt_pos = 0;
  
@@ -856,7 +923,7 @@ index b6c1a41..58ae9dc 100644
  	/* High speed, address 0 */
  	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
  	dwc_wr(DCFG, dcfg | 0);
-@@ -902,7 +983,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -902,7 +996,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	dwc_wr(DALEPENA, 0x3);
  	ud_start_setup();
  

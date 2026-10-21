@@ -136,3 +136,43 @@ Sharing panel screenshot or actual On switch + Sweet iOS destination selection.
 CUA previously very slow/failed; avoid blind retries. tcpdump BPF denied;
 sudo requires password; no root bypass attempted. net.inet.ip.forwarding=1
 is pre-existing observed state. Installed working boot remains unchanged.
+
+User subsequently actually enabled sharing. Confirmed com.apple.NetworkSharing
+running, NAT Enabled=1, SharingDevices=['en5']; bridge100 IPv4 192.168.2.1/24,
+member en5, phone MAC 02:00:5e:77:ee:02 learned on that bridge. User now sees
+Ethernet in iOS Settings (native discovery goal achieved). Async asks adapter
+Configure IP / IP Address / Router values. Need route/DNS/address validation.
+After Mac bridging starts old 192.168.7.2 no longer pings; 192.168.2.2 also
+not yet responding. Do not infer a DHCP lease. No internet verification yet.
+Live log receiver session91202 appends out/usb-network-live.log; fixed target
+192.168.7.1 may become unreachable when iOS moves to shared subnet2, so lack
+of future UDP logs may be routing change. Mac iOS service still configured
+manual7 but InternetSharing bridge owns subnet2; avoid changing Wi-Fi.
+
+User set manual Ethernet settings and reports website connects but page stays
+white. Internet HTTP success not independently proven: ping192.168.2.2 failed.
+Mac sharing still running bridge100192.168.2.1; en5 is bridge member with no
+IPv4 address (old7 UDP log target unreachable). Thus existing phone log is
+stale and cannot diagnose current WebKit state.
+Started fixed-content-only HTTP diagnostic tools/pixel-web-test.py on
+192.168.2.1:8080, server exec session79133, logs out/pixel-web-test.log.
+GET / HTML text only; GET /plain text/plain; no workspace file serving,
+only subnet192.168.2 clients allowed. Mac self-test2.1 HTTP200304bytes;
+firewall currently disabled (observed, not changed). Need user navigate
+http://192.168.2.1:8080/plain then inspect log for peer other than2.1.
+This separates completed network transfer from Safari/WebKit white rendering.
+No Safari/WebKit crash in old log, which ended before browser test. Don't
+assume missing GPU is established cause. No other graphics changes made.
+
+User clarifies plain test Safari title says Can't Open Page. No GET from
+phone in test server logs (only self-tests from2.1), so this is network load
+failure, not established rendering bug. Sharing active and USBpresent but
+phone2.2 doesn'tping. Requested photo ConfigureIP fields to verify settings.
+Found concrete missing BPF plumbing in sweet_usb.c: no bpfattach and no
+bpf_tap_in/out. Other XNU Ethernet drivers explicitly attach; bpf_setif
+returns ENXIO when no interface registration. IPConfiguration uses this for
+DHCP/ARP, explaining kernelping working but user-configured IP not applying.
+Added attach and rx/tx taps (same header-stripping convention as if_fake.c).
+Added sweetusblogip bootarg to select192.168.2.1 (0xc0a80201) for shared
+subnet and retained unsent log cursor until a route becomes ready.
+Next kernel CI needed. No HTTP internet success established yet.
