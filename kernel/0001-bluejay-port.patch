@@ -1359,10 +1359,10 @@ index 6114e30..ba63bca 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index d8a7f5a..e59a4f0 100644
+index d8a7f5a..f43e4f9 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -82,6 +82,17 @@ enum {
+@@ -82,6 +82,23 @@ enum {
  #define SWEET_FB_LOGICAL_W              1125
  #define SWEET_FB_LOGICAL_H              2436
  #define SWEET_FB_FORMAT_BGRA            0x42475241
@@ -1377,10 +1377,16 @@ index d8a7f5a..e59a4f0 100644
 +#define SWEET_DECON_TRIG_CON            0x30
 +#define SWEET_DECON_HW_TRIG_MASK        (1u << 4)
 +#define SWEET_DECON_IDLE_WAIT_US        20000
++/*
++ * GS101 DPU_DMA (Google cal_9845 regs-dpp.h): RDMA layers L0-L5 at
++ * 0x1C0B0000 + 0x1000 * n; +0x400 is the active (shadow) copy.
++ */
++#define SWEET_DPU_DMA                   0x1C0B0000ULL
++#define SWEET_DPU_DMA_LAYERS            6
  
  class IOMobileFramebuffer : public IOService {
  	OSDeclareDefaultStructors(IOMobileFramebuffer);
-@@ -119,6 +130,18 @@ public:
+@@ -119,6 +136,18 @@ public:
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
@@ -1399,7 +1405,7 @@ index d8a7f5a..e59a4f0 100644
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -127,6 +150,9 @@ public:
+@@ -127,6 +156,9 @@ public:
  	void present(const uint8_t *rec);
  	void presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
  	    int32_t dx, int32_t dy, int32_t w, int32_t h);
@@ -1409,7 +1415,7 @@ index d8a7f5a..e59a4f0 100644
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -218,6 +244,37 @@ AppleCLCD::start(IOService *provider)
+@@ -218,12 +250,70 @@ AppleCLCD::start(IOService *provider)
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -1447,7 +1453,40 @@ index d8a7f5a..e59a4f0 100644
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
-@@ -235,12 +292,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++#if defined(SWEET_BOARD_BLUEJAY)
++	/* sweetfb_dpuprobe=1: read-only dump of the scanout DMA, the first step
++	 * towards page flipping (which layer reads the ABL framebuffer, with
++	 * which stride and crop). Nothing is written. */
++	int probe = 0;
++	PE_parse_boot_argn("sweetfb_dpuprobe", &probe, sizeof(probe));
++	if (probe != 0) {
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SWEET_DPU_DMA,
++		    0x1000 * SWEET_DPU_DMA_LAYERS, kIODirectionIn);
++		IOMemoryMap *mm = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
++		OSSafeReleaseNULL(md);
++		if (mm != NULL) {
++			volatile uint32_t *dma = (volatile uint32_t *)mm->getVirtualAddress();
++			for (uint32_t l = 0; l < SWEET_DPU_DMA_LAYERS; l++) {
++				volatile uint32_t *r = dma + l * 0x400;    /* 0x1000 bytes */
++				IOLog("SWEET DPU: L%u en 0x%x ctrl0 0x%x size 0x%x off 0x%x img 0x%x "
++				    "base 0x%x/0x%x shd 0x%x stride 0x%x%s\n", l,
++				    r[0x000 / 4], r[0x008 / 4], r[0x010 / 4], r[0x014 / 4], r[0x018 / 4],
++				    r[0x040 / 4], r[0x044 / 4], r[0x440 / 4], r[0x050 / 4],
++				    (uint64_t)r[0x440 / 4] == (fPhys & 0xffffffffULL) ? " <- ABL framebuffer" : "");
++			}
++			mm->release();
++		} else {
++			IOLog("SWEET DPU: probe mapping failed\n");
++		}
++	}
++#endif
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	return true;
+@@ -235,12 +325,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -1466,7 +1505,7 @@ index d8a7f5a..e59a4f0 100644
  	IOLockLock(fb->fLock);
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
  		IOMobileFramebufferUserClient *client =
-@@ -253,6 +316,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -253,6 +349,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (step <= 6) {
  			fb->fFadeStep = step + 1;
  		}
@@ -1474,7 +1513,7 @@ index d8a7f5a..e59a4f0 100644
  		IOLockUnlock(fb->fLock);
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
-@@ -276,8 +340,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -276,8 +373,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	}
  	IOLockUnlock(fb->fLock);
  	if (rec != NULL) {
@@ -1488,7 +1527,7 @@ index d8a7f5a..e59a4f0 100644
  	}
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
-@@ -325,6 +394,7 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -325,6 +427,7 @@ AppleCLCD::swap(const uint8_t *rec)
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -1496,7 +1535,7 @@ index d8a7f5a..e59a4f0 100644
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
-@@ -347,6 +417,7 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -347,6 +450,7 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -1504,7 +1543,7 @@ index d8a7f5a..e59a4f0 100644
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -420,16 +491,103 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -420,16 +524,103 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		if (src != 0 && bpe == 4) {
  			for (int32_t y = 0; y < h; y++) {
