@@ -1,0 +1,57 @@
+# Working Pixel state (2026-10-20)
+
+Real phone: iOS reaches the lock screen; user confirms touch, navigation,
+animations and app interaction. Eight-core image is much faster than one,
+two and four cores. User estimates at least 12 fps; no FPS counter measured it.
+
+## Images and backups
+
+- Normal eight-core image: `out/phone-ios-8cpu/boot.img`.
+- Verified read-only backup: `backup/known-working-ios-8core-2026-10-20/boot.img`.
+  SHA256: `40ec13a6885a86542a08101154a75b3fd50d87d307a1bfd1a74e4e459c996c03`.
+- Full installation artifact backup (not a live phone data backup):
+  `backup/known-working-ios-1core-2026-10-20/`.
+- Installed root: `out/root-aligned.simg`. Fixer completed 321301 entries,
+  zero errors (IMG_5914). Its static entry aligns SP before C. The upstream
+  fixer failed with EXC_ARM_SP_ALIGN 0x103 (IMG_5912).
+- Do not reflash userdata while diagnosing graphics or boot persistence;
+  it contains the user's current iOS settings and changes.
+
+## Current task and scope
+
+User explicitly deferred graphics diagnosis. Blue-to-white rendering and black
+wallpaper remain unresolved. Focus is automatic boot and Settings persistence.
+The root is writable (`ufsrw=1 rootrw=1`); a specific Settings change still needs
+an end-to-end reboot test. Do not reflash userdata.
+
+## Permanent boot: installed and slot success verified
+
+The backed-up eight-core image above was flashed successfully to boot_a.
+Live DevInfo was inspected at LUN 3 LBA 6, magic DEVI, version 3.15.
+The guarded one-time `shimmarka` helper backed up the original 4096-byte block
+to userdata slack LBA 0x1dbfff9, outside HFS and the log ring, and verified it.
+It changed only slot A's successful bit: word 0x00000c03 -> 0x00000e03.
+Full-block readback verified all other bytes unchanged and storage flushed
+(IMG_5926). Fastboot independently confirmed current-slot a,
+slot-successful:a yes, slot-unbootable:a no, retry-count:a 3.
+Audit: `backup/boot-success-update-2026-10-20.json`.
+
+Normal `fastboot reboot` returned OKAY after advance recording notice.
+User confirmed this normal installed boot reached the iOS lock screen.
+A complete power-cycle and a selected Settings persistence test remain unverified.
+Reflashing boot may clear the success flag again; check it after future flashes.
+
+Fastboot refuses fetch of boot_a, boot_b and devinfo. Zero-byte files from those
+failed attempts are NOT backups. Factory boot is in `backup/stock/boot.img`.
+The DevInfo original backup is on phone storage, not yet exported to the Mac.
+
+User requests advance notice before boots to record them.
+
+## USB internet and battery work (active)
+
+User requested both. See `docs/network-battery.md`. Diagnostic built at
+`out/phone-power-usb/boot.img`; QEMU skips hardware correctly. Awaiting user
+fastboot readiness before temporary diagnostic boot; give advance notice.
+Kernel source now has opt-in sweetbattery=2 and sweetusb=2 Pixel paths.
+Decoder tests pass; full CI and all phone verification still pending.
+No installed boot partition or userdata changes made for this work.

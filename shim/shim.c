@@ -1050,10 +1050,11 @@ static u64 ufs_ucd_override;	/* 0: the shim's buffer, else ABL's command buffer 
 static u32 ufs_cmd(u64 hci, u64 list, int slot, u8 lun, const u8 *cdb, int cdb_len, u64 data, u32 len)
 {
 	u64 ucd = ufs_ucd_override ? ufs_ucd_override : sym_addr_ucd(), utrd = list + 32 * slot;
+	int write = cdb[0] == 0x2a; /* only the bounded boot-success helper uses WRITE(10) */
 	zero32(ucd, 1024 + 16);
 	zero32(utrd, 32);
 	/* task tag = slot, as Linux does: the Exynos host matches responses by it */
-	wr32(ucd + 0, (u32)0x01 | (len ? 0x40u : 0) << 8 | (u32)lun << 16 | (u32)slot << 24);
+	wr32(ucd + 0, (u32)0x01 | (len ? (write ? 0x20u : 0x40u) : 0) << 8 | (u32)lun << 16 | (u32)slot << 24);
 	wr32(ucd + 12, __builtin_bswap32(len));
 	u32 c[4] = { 0, 0, 0, 0 };
 	for (int i = 0; i < cdb_len; i++)
@@ -1065,7 +1066,7 @@ static u32 ufs_cmd(u64 hci, u64 list, int slot, u8 lun, const u8 *cdb, int cdb_l
 		wr32(ucd + 1024 + 4, (u32)(data >> 32));
 		wr32(ucd + 1024 + 12, len - 1);
 	}
-	wr32(utrd + 0, (1u << 28) | ((len ? 2u : 0u) << 25) | (1u << 24));
+	wr32(utrd + 0, (1u << 28) | ((len ? (write ? 1u : 2u) : 0u) << 25) | (1u << 24));
 	wr32(utrd + 8, 0x0f);
 	wr32(utrd + 16, (u32)ucd);
 	wr32(utrd + 20, (u32)(ucd >> 32));
@@ -1255,10 +1256,22 @@ static void prepare_ufs(u64 dtb, int test)
 
 }
 
+#include "log-viewer.h"
+#include "mark-success.h"
+#include "power-usb.h"
+
 static void __attribute__((noreturn)) diag(u64 dtb)
 {
 	u64 v;
 	u32 len;
+	if (chosen_prop(dtb, "bootargs", &v, &len) && contains((const char *)v, len, "shimpowerusb"))
+		diag_power_usb(dtb);
+	if (chosen_prop(dtb, "bootargs", &v, &len) && contains((const char *)v, len, "shimmarka"))
+		diag_mark_a(dtb);
+	if (chosen_prop(dtb, "bootargs", &v, &len) && contains((const char *)v, len, "shimslot"))
+		diag_slots(dtb);
+	if (chosen_prop(dtb, "bootargs", &v, &len) && contains((const char *)v, len, "shimlog"))
+		diag_log(dtb);
 	say(C_OK, "DIAGNOSTIC BOOT (docs/bringup.md)");
 	kv2("PSCI ", smc(0x84000000, 0, 0, 0), " SMCCC ", smc(0x80000000, 0, 0, 0));
 	if (chosen_prop(dtb, "bootargs", &v, &len)) {
