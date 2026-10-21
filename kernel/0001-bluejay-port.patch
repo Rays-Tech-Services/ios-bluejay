@@ -636,7 +636,7 @@ index 53e5095..6d5def7 100644
  probed:
  	lck_mtx_unlock(&sweet_ufs_lock);
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index b6c1a41..11f142d 100644
+index b6c1a41..1dd3dc1 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -21,6 +21,7 @@
@@ -668,7 +668,7 @@ index b6c1a41..11f142d 100644
 +		uint32_t id = usb_rd(dwc, 0xc120);
 +		printf("BLUEJAY USB: inherited DWC3 ID 0x%08x GCTL 0x%08x DCTL 0x%08x DSTS 0x%08x\n",
 +		    id, usb_rd(dwc, 0xc110), usb_rd(dwc, 0xc704), usb_rd(dwc, 0xc70c));
-+		if ((id & 0xffff0000u) != 0x55330000u && id != 0x3331302a) {
++		if ((id & 0xffff0000u) != 0x55330000u && (id & 0xffff0000u) != 0x33310000u) {
 +			printf("BLUEJAY USB: unknown DWC3 generation; not started\n");
 +			return;
 +		}

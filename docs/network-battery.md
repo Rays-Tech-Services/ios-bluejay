@@ -77,3 +77,13 @@ network interface or change global PF rules while guessing the USB interface.
 fault states, missing input path and rejected implausible samples. The decoder
 in `kernel/include/BluejayBatteryData.h` must match the header added by the port
 patch. Full kernel CI and hardware measurements remain necessary.
+
+## Real observer result (IMG_5930)
+
+All identity/node checks passed. MAX77759 DevName 0x6200; RepSOC 0x627f
+(98.496%), VCell 0xde6a (4448 mV), temperature 0x1600 (22 C). Charger
+INT_OK 0xd9, DETAILS_00 0x60, DETAILS_01 0xb1, DETAILS_02 0x20 indicate
+valid USB input and fast charging. Cable transition and iOS reporting remain
+to verify. DWC3 GSNPSID is 0x33313130, VER_NUMBER 0x3138302a (DWC3.1).
+The original kernel guard incorrectly compared the ID to a version-format
+value; corrected to recognize the DWC3.1 ID family 0x3331xxxx, matching Linux.

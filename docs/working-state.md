@@ -65,3 +65,10 @@ Kernel QEMU smoke with sweetusb=2 sweetbattery=2 reached test HFS root and
 launchd exec; expected errno 2 panic because the smoke disk has no launchd.
 Hardware battery readings, USB enumeration and internet are not verified.
 No installed boot partition or userdata changes made for this work.
+
+IMG_5930 observer: real battery register reads valid (~98.5%, 4448mV, 22C),
+charging active. DWC3.1 ID 0x33313130, VER_NUMBER 0x3138302a. Corrected
+kernel ID guard (old test kernel rejects this ID without starting USB).
+Need new CI artifact before iOS USB/battery hardware test; do not use old
+USB test kernel expecting enumeration. Photo contains raw observations in
+`out/usb-battery-test-state.json` (local). No installed image changed.
