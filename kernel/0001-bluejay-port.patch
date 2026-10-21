@@ -952,7 +952,7 @@ index d2f81be..f02590b 100644
  	if (load_result.unixproc) {
  		user_addr_t     ap;
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 9969739..4212af3 100644
+index 9969739..dfcc886 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -12,8 +12,14 @@
@@ -1085,11 +1085,10 @@ index 9969739..4212af3 100644
  	uint8_t type, present, usb, path, charger, error, temperature;
  	uint16_t rawVoltage;
  	bool valid = fReal &&
-@@ -246,13 +284,178 @@ SweetBattery::poll(void)
+@@ -246,13 +284,177 @@ SweetBattery::poll(void)
  	    charging, full, true, currentValid);
  }
  
-+void
 +/*
 + * ACPM DVFS from the kernel: the same transport the shim uses for the PMIC
 + * and for the boot-time CPU clocks (shim/shim.c acpm_xfer; mainline
@@ -1265,7 +1264,7 @@ index 9969739..4212af3 100644
  	}
  }
  
-@@ -264,7 +467,14 @@ SweetBattery::start(IOService *provider)
+@@ -264,7 +466,14 @@ SweetBattery::start(IOService *provider)
  	}
  	int real = 0;
  	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
@@ -1281,7 +1280,7 @@ index 9969739..4212af3 100644
  	/* Publish a complete source BEFORE registerService wakes powerd. */
  	poll();
  	if (fReal) {
-@@ -273,9 +483,10 @@ SweetBattery::start(IOService *provider)
+@@ -273,9 +482,10 @@ SweetBattery::start(IOService *provider)
  		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
  			fTimerAdded = true;
  			fRunning = true;
