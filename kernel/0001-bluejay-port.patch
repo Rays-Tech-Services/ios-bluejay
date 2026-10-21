@@ -1088,6 +1088,63 @@ index 0631685..8e92823 100644
   */
 +#include "SweetUSBNetwork.h"
  #endif /* SWEET */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..9817cd1 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,8 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>
++#include "SweetSurfaceFormat.h"
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -316,7 +318,8 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 			}
+ 			p->width = sweet_dict_u32(pd, "IOSurfacePlaneWidth", s->width);
+ 			p->height = sweet_dict_u32(pd, "IOSurfacePlaneHeight", s->height);
+-			p->bytesPerElement = (uint16_t)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerElement", 1);
++			p->bytesPerElement = (uint16_t)sweet_dict_u32(pd, "IOSurfacePlaneBytesPerElement",
++			    sweet_surface_plane_default_bpe(s->pixelFormat, i));
+ 			p->elementWidth = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementWidth", 1);
+ 			p->elementHeight = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementHeight", 1);
+ 			if (p->width > SWEET_SURFACE_MAX_DIM || p->height > SWEET_SURFACE_MAX_DIM ||
+@@ -684,6 +687,33 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
++	/* Diagnostic compatibility mode, off by default. iOS 16 WebKit reads
++	 * IOSurfaceGetPixelFormat() back before selecting its CG context. Give
++	 * that path a complete BGRA layout, before allocation or painting, rather
++	 * than trying to interpret already-painted RGB10 pixels as BGRA. Do not
++	 * alter other clients, child surfaces, or their requested formats. */
++	int webBGRA = 0;
++	char creator[32];
++	proc_selfname(creator, sizeof(creator));
++	PE_parse_boot_argn("sweetweb_bgra", &webBGRA, sizeof(webBGRA));
++	if (ret == kIOReturnSuccess &&
++	    sweet_surface_web_bgra(webBGRA != 0, creator, s->pixelFormat, s->parentID)) {
++		SweetSurfaceBGRALayout layout;
++		if (!sweet_surface_bgra_layout(s->width, s->height, page_size, &layout)) {
++			ret = kIOReturnBadArgument;
++		} else {
++			IOLog("SWEET SURF: %s software BGRA %ux%u requested 0x%x -> 0x%x\n",
++			    creator, s->width, s->height, s->pixelFormat, SWEET_FORMAT_BGRA);
++			s->pixelFormat = SWEET_FORMAT_BGRA;
++			s->bytesPerElement = 4;
++			s->elementWidth = s->elementHeight = 1;
++			s->offset = 0;
++			s->bytesPerRow = layout.rowBytes;
++			s->allocSize = layout.allocSize;
++			s->planeCount = 0;
++			bzero(s->planes, sizeof(s->planes));
++		}
++	}
+ 	if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index 44f005f..87e9a13 100644
 --- a/makedefs/MakeInc.def
@@ -1531,6 +1588,60 @@ index 0000000..c9e70f6
 + s->charging=s->external && (details2&0x20) && state<=3;
 + s->full=s->external && state==4;
 + return true;
++}
++#endif
+diff --git a/iokit/Kernel/arm/SweetSurfaceFormat.h b/iokit/Kernel/arm/SweetSurfaceFormat.h
+new file mode 100644
+index 0000000..34c01ed
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetSurfaceFormat.h
+@@ -0,0 +1,48 @@
++/* Geometry policy shared by the kernel and the host-side checks. */
++#ifndef SWEET_SURFACE_FORMAT_H
++#define SWEET_SURFACE_FORMAT_H
++
++#define SWEET_FORMAT_BGRA 0x42475241u
++#define SWEET_FORMAT_RGB10 0x77333072u
++#define SWEET_FORMAT_RGB10A8 0x62336138u
++
++static inline unsigned
++sweet_surface_plane_default_bpe(unsigned format, unsigned plane)
++{
++	/* WebKit supplies stride/offset/size, but omits PlaneBytesPerElement. */
++	return format == SWEET_FORMAT_RGB10A8 && plane == 0 ? 4 : 1;
++}
++
++static inline bool
++sweet_surface_web_bgra(bool enabled, const char *process, unsigned format,
++    unsigned parent)
++{
++	return enabled && parent == 0 &&
++	       (format == SWEET_FORMAT_RGB10 || format == SWEET_FORMAT_RGB10A8) &&
++	       (!__builtin_strcmp(process, "com.apple.WebKit.WebContent") ||
++	        !__builtin_strcmp(process, "com.apple.WebKit.GPU"));
++}
++
++struct SweetSurfaceBGRALayout {
++	unsigned rowBytes, allocSize;
++};
++
++static inline bool
++sweet_surface_bgra_layout(unsigned width, unsigned height, unsigned pageSize,
++    SweetSurfaceBGRALayout *result)
++{
++	if (!width || !height || width > 16384 || height > 16384 ||
++	    pageSize < 64 || pageSize > 65536 || (pageSize & (pageSize - 1))) {
++		return false;
++	}
++	unsigned row = (width * 4u + 63u) & ~63u;
++	unsigned long long size = (unsigned long long)row * height;
++	size = (size + pageSize - 1) & ~(unsigned long long)(pageSize - 1);
++	if (size > (256u << 20)) {
++		return false;
++	}
++	result->rowBytes = row;
++	result->allocSize = (unsigned)size;
++	return true;
 +}
 +#endif
 diff --git a/iokit/Kernel/arm/SweetUSBNetwork.h b/iokit/Kernel/arm/SweetUSBNetwork.h
