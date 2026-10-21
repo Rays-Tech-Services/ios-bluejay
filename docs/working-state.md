@@ -53,7 +53,15 @@ User requested both. See `docs/network-battery.md`. Diagnostic built at
 `out/phone-power-usb/boot.img`; QEMU skips hardware correctly. Awaiting user
 fastboot readiness before temporary diagnostic boot; give advance notice.
 Kernel source now has opt-in sweetbattery=2 and sweetusb=2 Pixel paths.
-Decoder tests pass; CI run 39532556491 is building commit 3bf96f0.
+Decoder tests pass; CI run 39532556491 successfully built commit 3bf96f0.
 https://github.com/Rays-Tech-Services/ios-bluejay/actions/runs/39532556491
-All phone verification for these features is still pending.
+Kernel SHA256 e91e24b60c310b3e9041bf75a2d960bfe17671b17bf7fe36c191643395b553be.
+Test image: out/phone-ios-usb-battery/boot.img (8 CPUs, sweetusb=2 sweetbattery=2).
+First temporary observer boot succeeded but guard skipped the real phone:
+Google vendor DT identifies google,GS101 BLUEJAY (not google,bluejay).
+Corrected observer recognizes that identity and requires actual USB/UFS nodes;
+QEMU still skips correctly. Corrected observer temporarily booted successfully; awaiting photo.
+Kernel QEMU smoke with sweetusb=2 sweetbattery=2 reached test HFS root and
+launchd exec; expected errno 2 panic because the smoke disk has no launchd.
+Hardware battery readings, USB enumeration and internet are not verified.
 No installed boot partition or userdata changes made for this work.

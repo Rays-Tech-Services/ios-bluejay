@@ -48,9 +48,24 @@ static void pb_word(const char *name,u8 reg) {
 }
 static void __attribute__((noreturn)) diag_power_usb(u64 dtb) {
  say(C_OK,"PIXEL BATTERY + USB OBSERVER (no storage writes)");
- struct fdt f; int phone=0;
- fdt_begin(&f,dtb); while(fdt_next(&f)) if(prop_is(&f,"compatible") && contains((const char *)f.val,f.len,"google,bluejay")) phone=1;
- if (!phone) { say(C_WARN,"Not bluejay hardware: skipping all device access"); for (;;) __asm__ volatile("wfe"); }
+ /* Google's vendor DT uses "google,GS101 BLUEJAY" (upper case),
+  * unlike our generated XNU ADT. Also require the actual USB and UFS
+  * nodes: QEMU intentionally has a Pixel-like model/compatible string. */
+ struct fdt f; int identity=0, usb_node=0, ufs_node=0;
+ fdt_begin(&f,dtb);
+ while(fdt_next(&f)) {
+  if (!prop_is(&f,"compatible")) continue;
+  const char *c=(const char *)f.val;
+  if (f.depth==1 && (contains(c,f.len,"google,GS101 BLUEJAY") || contains(c,f.len,"google,bluejay"))) identity=1;
+  u64 a,size;
+  if (node_reg(&f,0,&a,&size)) {
+   if (a==0x11110000 && size>=0xd000 && (contains(c,f.len,"dwusb") || contains(c,f.len,"dwc3"))) usb_node=1;
+   if (a==0x14700000 && contains(c,f.len,"ufs")) ufs_node=1;
+  }
+ }
+ kv2("Hardware guard identity ",identity," USB node ",usb_node);
+ kv("Hardware guard UFS node ",ufs_node);
+ if (!(identity && usb_node && ufs_node)) { say(C_WARN,"Not bluejay hardware: skipping all device access"); for (;;) __asm__ volatile("wfe"); }
  kv2("I2C12 GPIO mux ",rd32(PB_BANK)," data ",rd32(PB_BANK+4));
  pb_word("FG DevName 0x21 = ",0x21); pb_word("FG RepSOC 0x06 (8.8 percent) = ",0x06);
  pb_word("FG VCell 0x09 (raw) = ",0x09); pb_word("FG Temp 0x08 (signed 8.8 C) = ",0x08);

@@ -11,7 +11,10 @@ observer. It reads MAX77759 fuel gauge and charger status via software I2C12,
 then reads the DWC3 state left by fastboot. No storage writes, gauge configuration,
 charger configuration, or USB controller writes. GPIOs are temporarily used as
 open-drain and restored after each transaction; clock stretching has a timeout.
-It checks the real FDT for google,bluejay before hardware access. QEMU verified
+It checks the real FDT for Google's vendor identity `google,GS101 BLUEJAY`
+(or the canonical identity) plus USB at 0x11110000 and UFS at 0x14700000
+before hardware access. The first phone test was incorrectly skipped because
+the initial guard only accepted the canonical identity; this is corrected. QEMU verified
 that other hardware is skipped. Photograph the initial screen, then unplug/replug
 the cable and compare SOC / USB status lines. This diagnostic does not boot iOS.
 
