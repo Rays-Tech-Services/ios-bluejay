@@ -913,7 +913,7 @@ static void cpu_clocks(int level, int verbose)
 		{ 1803000, 2253000, 2253000 },
 		{ 1803000, 2253000, 2802000 },
 	};
-	static const char *const names[3] = { "  A55 ", "  A76 ", "  X1  " };
+	static const char names[3][8] = { "  A55 ", "  A76 ", "  X1  " };
 	for (int c = 0; c < 3; c++) {
 		u32 before = 0, after = 0;
 		int e = acpm_dvfs(ACPM_DVFS_CPUCL0 + c, 0, &before);
