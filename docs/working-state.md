@@ -99,3 +99,24 @@ because they unplugged; replug failed. Fresh v2 temporary boot: 3/3 ping
 succeeded and live UDP logs captured. User says no Ethernet in Settings.
 Preparing IOKit interface discovery bridge / en0 for native iOS DHCP and
 DWC3 active-transfer / EP0 reset handling. Mac Internet Sharing still off.
+
+CI 39536976696 (91d3286) succeeded for IOKit discovery / reconnect attempt.
+Kernel out/ci-usb-network/kernel.development.sweet SHA256
+c579df292c80f8de9caa12f88d90e265fe37899e593c2071d9374778a569c531.
+Packed out/phone-ios-usb-network/boot.img (8 CPUs, same writable iOS flags,
+sweetusb=2 sweetbattery=2). QEMU passed through HFS root to launchd exec
+(expected missing-launchd errno2 on smoke disk). Not yet booted on phone.
+
+Mac System Settings CUA failed: getApp opened Keyboard; General selected,
+then Sharing click failed "Computer Use is not active" after long delays.
+Do not keep retrying slow UI calls blindly. No Internet Sharing setting changed
+through CUA. User asked via async to manually enable Wi-Fi sharing to ONLY
+Sweet iOS (USB Ethernet). At last check bridge100 absent and InternetSharing
+service absent. Existing net.inet.ip.forwarding=1 was observed, not changed
+by us. Need enable sharing, then ask user for fastboot for new kernel.
+
+Read-only local root image inspection was detached (/dev/disk4). The iOS cache
+has addNetworkInterface -x -s with IOKit launch event and controller allowlist
+including IOUserNetworkEthernet. New discovery adapter targets this.
+Packet proof is local only: no default route/DNS or internet verified yet.
+Live capture received 196212 bytes (out/usb-battery-live.log, private).
