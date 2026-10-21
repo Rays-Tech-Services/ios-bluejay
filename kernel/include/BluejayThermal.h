@@ -12,11 +12,15 @@ struct BluejayThermalLevel {
 
 /* Level 0 = full speed (X1 at the boot-arg maximum), 1 = warm, 2 = hot. */
 static inline BluejayThermalLevel
-bluejay_thermal_clocks(unsigned level, unsigned x1_max_khz)
+bluejay_thermal_clocks(unsigned level, unsigned x1_max_khz,
+    unsigned a76_max_khz = 2253000u)
 {
 	BluejayThermalLevel l;
 	l.a76_khz = level >= 2 ? 1803000u : 2253000u;
 	l.x1_khz = level >= 2 ? 1803000u : level == 1 ? 2253000u : x1_max_khz;
+	if (l.a76_khz > a76_max_khz) {
+		l.a76_khz = a76_max_khz;
+	}
 	if (l.x1_khz > x1_max_khz) {
 		l.x1_khz = x1_max_khz;
 	}

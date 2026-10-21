@@ -31,6 +31,15 @@ int main()
 	assert(l.x1_khz == 2253000);
 	l = bluejay_thermal_clocks(1, 2000000);
 	assert(l.x1_khz == 2000000);
+	/* Neither cluster may exceed a lower boot ceiling, at any temperature. */
+	for (unsigned level = 0; level < 3; ++level) {
+		l = bluejay_thermal_clocks(level, 1500000, 1200000);
+		assert(l.x1_khz <= 1500000 && l.a76_khz <= 1200000);
+	}
+	assert(bluejay_thermal_next(2, 4200) == 2);
+	assert(bluejay_thermal_next(1, 3800) == 1);
+	assert(bluejay_thermal_next(1, 8001) == 2);
+	assert(bluejay_thermal_next(2, -2001) == 2);
 	puts("thermal policy checks passed");
 	return 0;
 }
