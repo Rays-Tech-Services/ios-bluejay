@@ -810,15 +810,16 @@ static void diag_ufs(u64 dtb)
 static u8 acpm_seq;
 
 /*
- * One PMIC request on ACPM channel 2: func 0 = read, 2 = update(value, mask).
- * Returns 0 and the register value in *out, or a negative code.
+ * One request on ACPM channel chan. cmd[0] bits 21:16 receive the sequence
+ * number; the firmware echoes it in its reply, whose second word goes to
+ * *rx1. Returns 0, or a negative code.
  */
-static int acpm_pmic(u8 reg, u8 func, u8 value, u8 mask, u8 *out)
+static int acpm_xfer(u32 chan, u32 cmd[4], u32 *rx1)
 {
 	u64 shmem = APM_SRAM + ACPM_INITDATA;
-	if (rd32(shmem + 24) <= ACPM_PMIC_CHAN)		/* num_chans */
+	if (rd32(shmem + 24) <= chan)			/* num_chans */
 		return -1;
-	u64 ch = APM_SRAM + rd32(shmem + 8) + ACPM_PMIC_CHAN * 72;	/* acpm_chan_shmem */
+	u64 ch = APM_SRAM + rd32(shmem + 8) + chan * 72;	/* acpm_chan_shmem */
 	u32 qlen = rd32(ch + 52), mlen = rd32(ch + 56);
 	if (!qlen || qlen > 64 || mlen < 16 || mlen > 256)
 		return -2;
@@ -833,15 +834,11 @@ static int acpm_pmic(u8 reg, u8 func, u8 value, u8 mask, u8 *out)
 		delay_ms(1);
 	}
 	acpm_seq = acpm_seq % 63 + 1;
-	u32 cmd[4];
-	cmd[0] = (u32)acpm_seq << 16 | (0u << 12) | (1u << 8) | reg;	/* speedy 0, type PMIC */
-	cmd[1] = (u32)mask << 16 | (u32)value << 8 | func;
-	cmd[2] = 0;
-	cmd[3] = (u32)(now() / (timer_hz / 1000));
+	cmd[0] = (cmd[0] & ~(0x3fu << 16)) | (u32)acpm_seq << 16;
 	for (int i = 0; i < 4; i++)
 		wr32(tx_base + mlen * front + 4 * i, cmd[i]);
 	wr32(tx_front, next);
-	wr32(AP2APM_MBOX + MBOX_INTGR1, 1u << ACPM_PMIC_CHAN);
+	wr32(AP2APM_MBOX + MBOX_INTGR1, 1u << chan);
 
 	for (int t = 0; t < 2000; t++) {		/* ~100 ms */
 		u32 i = rd32(rx_rear), f = rd32(rx_front);
@@ -857,15 +854,84 @@ static int acpm_pmic(u8 reg, u8 func, u8 value, u8 mask, u8 *out)
 		}
 		wr32(rx_rear, f);
 		if (got) {
-			if (out)
-				*out = (u8)(w1 >> 8);
-			return (w1 >> 24) ? -(int)(w1 >> 24) - 10 : 0;
+			if (rx1)
+				*rx1 = w1;
+			return 0;
 		}
 		u64 t0 = now();
 		while (now() - t0 < timer_hz / 20000)	/* 50 us */
 			;
 	}
 	return -4;					/* no answer */
+}
+
+/*
+ * One PMIC request on ACPM channel 2: func 0 = read, 2 = update(value, mask).
+ * Returns 0 and the register value in *out, or a negative code.
+ */
+static int acpm_pmic(u8 reg, u8 func, u8 value, u8 mask, u8 *out)
+{
+	u32 cmd[4], w1 = 0;
+	cmd[0] = (0u << 12) | (1u << 8) | reg;		/* speedy 0, type PMIC */
+	cmd[1] = (u32)mask << 16 | (u32)value << 8 | func;
+	cmd[2] = 0;
+	cmd[3] = (u32)(now() / (timer_hz / 1000));
+	int e = acpm_xfer(ACPM_PMIC_CHAN, cmd, &w1);
+	if (e)
+		return e;
+	if (out)
+		*out = (u8)(w1 >> 8);
+	return (w1 >> 24) ? -(int)(w1 >> 24) - 10 : 0;
+}
+
+/*
+ * CPU cluster clocks through ACPM DVFS (mainline exynos-acpm-dvfs.c,
+ * clk-acpm.c: channel 0; domains 2/3/4 = CPUCL0 A55, CPUCL1 A76, CPUCL2 X1).
+ * The firmware picks the operating point and its voltage. khz 0 = query.
+ */
+static int acpm_dvfs(u32 domain, u32 khz, u32 *khz_out)
+{
+	u32 cmd[4], w1 = 0;
+	cmd[0] = domain & 0xfff;
+	cmd[1] = khz;
+	cmd[2] = khz ? ACPM_DVFS_FREQ_REQ : ACPM_DVFS_FREQ_GET;
+	cmd[3] = (u32)(now() / (timer_hz / 1000));
+	int e = acpm_xfer(ACPM_DVFS_CHAN, cmd, &w1);
+	if (!e && khz_out)
+		*khz_out = w1;
+	return e;
+}
+
+/*
+ * ABL leaves every cluster near 1.1-1.2 GHz (measured with sweetcpu_mhz=1).
+ * shimcpu=1: A55 1.8, A76 2.25, X1 2.25 GHz; shimcpu=2: X1 2.8 GHz too.
+ * XNU has no thermal management: shimcpu=2 can run hot under sustained load.
+ */
+static void cpu_clocks(int level, int verbose)
+{
+	static const u32 khz[2][3] = {
+		{ 1803000, 2253000, 2253000 },
+		{ 1803000, 2253000, 2802000 },
+	};
+	static const char *const names[3] = { "  A55 ", "  A76 ", "  X1  " };
+	for (int c = 0; c < 3; c++) {
+		u32 before = 0, after = 0;
+		int e = acpm_dvfs(ACPM_DVFS_CPUCL0 + c, 0, &before);
+		if (!e)
+			e = acpm_dvfs(ACPM_DVFS_CPUCL0 + c, khz[level - 1][c], 0);
+		if (!e)
+			e = acpm_dvfs(ACPM_DVFS_CPUCL0 + c, 0, &after);
+		if (verbose || e) {
+			puts_(names[c]);
+			puthex(before, 8);
+			puts_(" -> ");
+			puthex(after, 8);
+			puts_(" kHz");
+			newline();
+		}
+		if (e)
+			kv("  ACPM DVFS error ", (u32)-e);
+	}
 }
 
 /* Switch on the touch supplies, keeping a firmware voltage when in the rail's range. */
@@ -1428,6 +1494,10 @@ __attribute__((used)) void shim_main(u64 dtb, u64 base, u64 entry_el)
 	/* Touch supplies on before XNU (bsd/dev/bluejay_touch.c resets the chip). */
 	if (fdt_has_decon(dtb) && !payload_flag(p, "shimtouchpwr=0"))
 		touch_power(1);
+	if (fdt_has_decon(dtb) && payload_flag(p, "shimcpu=1"))
+		cpu_clocks(1, 1);
+	else if (fdt_has_decon(dtb) && payload_flag(p, "shimcpu=2"))
+		cpu_clocks(2, 1);
 	/* ABL leaves both the UFS link and device asleep. Resume them using
 	 * the same sequence verified by the diagnostic's GPT read. */
 	if (fdt_has_decon(dtb) && !payload_flag(p, "shimufs=0"))

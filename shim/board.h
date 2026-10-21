@@ -73,5 +73,9 @@ static inline int key_bit(int k)
 #define AP2APM_MBOX		0x17610000UL
 #define MBOX_INTGR1		0x40
 #define ACPM_PMIC_CHAN		2
+#define ACPM_DVFS_CHAN		0
+#define ACPM_DVFS_CPUCL0	2
+#define ACPM_DVFS_FREQ_REQ	0
+#define ACPM_DVFS_FREQ_GET	1
 #define S2MPG10_L25M_CTRL	0x5c
 #define S2MPG10_L26M_CTRL	0x5d
