@@ -934,24 +934,43 @@ index b6c1a41..99263d6 100644
  	if (qs != 0) {
  		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
  		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index d2f81be..f02590b 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1718,6 +1718,12 @@ grade:
+ 
+ 	/* Switch to target task's map to copy out strings */
+ 	old_map = vm_map_switch(get_task_map(task));
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		extern void sweet_exec_fixup(struct proc *p, const char *name, task_t task);
++		sweet_exec_fixup(p, p->p_name, task);
++	}
++#endif
+ 
+ 	if (load_result.unixproc) {
+ 		user_addr_t     ap;
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
-index 9969739..eed20eb 100644
+index 9969739..0587e37 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
-@@ -12,8 +12,12 @@
+@@ -12,8 +12,14 @@
  #include <IOKit/pwr_mgt/IOPMPowerSource.h>
  #include <libkern/c++/OSCollectionIterator.h>
  #include <pexpert/pexpert.h>
 +#include <pexpert/device_tree.h>
 +#include <kern/clock.h>
 +#include "BluejayBattery.h"
++#include "BluejayThermal.h"
++#include <IOKit/IOMemoryDescriptor.h>
  /* bsd/dev/sweet_spmi.c */
  extern "C" int sweet_spmi_init(void);
 +extern "C" int a40_platform(void);     /* bsd/dev/a40_keys.c: not the Qualcomm sweet */
  extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
  
  class SweetBattery : public IOPMPowerSource {
-@@ -26,7 +30,8 @@ public:
+@@ -26,8 +32,17 @@ public:
  private:
  	IOWorkLoop *fLoop;
  	IOTimerEventSource *fTimer;
@@ -959,9 +978,30 @@ index 9969739..eed20eb 100644
 +	bool fTimerAdded, fRunning, fReal, fBluejay;
 +	int fTemperature;
  	int fLastMode;
++	/* sweetthermal=1 (bluejay): clocks follow the battery temperature. */
++	IOMemoryMap *fApmMap, *fMboxMap;
++	unsigned fThermalLevel, fX1MaxKHz;
++	uint8_t fAcpmSeq;
++	bool fThermal;
++	void thermalStart(void);
++	void thermalPoll(void);
++	int acpmDvfs(unsigned domain, unsigned khz, unsigned *out);
  	void putNumber(const char *key, UInt32 value);
  	void putBool(const char *key, bool value);
-@@ -72,6 +77,8 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -52,6 +67,11 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+ 	fTimerAdded = fRunning = fReal = false;
++	fApmMap = fMboxMap = NULL;
++	fThermalLevel = 0;
++	fX1MaxKHz = 0;
++	fAcpmSeq = 0;
++	fThermal = false;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -72,6 +92,8 @@ SweetBattery::init(OSDictionary *dictionary)
  		}
  	}
  	fLastMode = -1;
@@ -970,7 +1010,7 @@ index 9969739..eed20eb 100644
  	return true;
  }
  
-@@ -102,10 +109,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -102,10 +124,11 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
      bool capable, bool charging, bool full, bool measured, bool currentValid)
  {
  	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
@@ -984,7 +1024,7 @@ index 9969739..eed20eb 100644
  	setExternalConnected(external);
  	setExternalChargeCapable(capable);
  	setIsCharging(charging);
-@@ -119,15 +127,15 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -119,15 +142,15 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
  	putBool("FullyCharged", full);
  	putBool("AppleRawExternalConnected", external);
  	putNumber("AppleRawCurrentCapacity", capacity);
@@ -1005,7 +1045,7 @@ index 9969739..eed20eb 100644
  	putBool("SweetBatteryFallback", !measured);
  	putNumber("SweetBatteryPercent", percent);
  
-@@ -137,7 +145,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -137,7 +160,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
  		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
  		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
  		    kIOBatteryFlagsKey};
@@ -1014,7 +1054,7 @@ index 9969739..eed20eb 100644
  		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
  		    (charging ? kIOBatteryCharge : 0))};
  		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
-@@ -154,7 +162,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -154,7 +177,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
  	int mode = measured ? 1 : 0;
  	if (mode != fLastMode) {
  		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
@@ -1023,7 +1063,7 @@ index 9969739..eed20eb 100644
  		    percent, mv, external, charging);
  		fLastMode = mode;
  	}
-@@ -206,6 +214,18 @@ SweetBattery::estimatePercent(unsigned mv)
+@@ -206,6 +229,19 @@ SweetBattery::estimatePercent(unsigned mv)
  void
  SweetBattery::poll(void)
  {
@@ -1033,6 +1073,7 @@ index 9969739..eed20eb 100644
 +			fTemperature = sample.temperature;
 +			publish(sample.percent, sample.mv, 0, sample.external, sample.external,
 +			    sample.charging, sample.full, true, false);
++			thermalPoll();
 +		} else {
 +			/* Preserve the last good sample; a bus failure is not 0% or 100%. */
 +			IOLog("BLUEJAY BATTERY: sample failed; retaining previous status\n");
@@ -1042,7 +1083,162 @@ index 9969739..eed20eb 100644
  	uint8_t type, present, usb, path, charger, error, temperature;
  	uint16_t rawVoltage;
  	bool valid = fReal &&
-@@ -252,7 +272,7 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -246,13 +282,162 @@ SweetBattery::poll(void)
+ 	    charging, full, true, currentValid);
+ }
+ 
++void
++/*
++ * ACPM DVFS from the kernel: the same transport the shim uses for the PMIC
++ * and for the boot-time CPU clocks (shim/shim.c acpm_xfer; mainline
++ * exynos-acpm.c / exynos-acpm-dvfs.c). Channel 0, request {domain, kHz,
++ * 0 = set / 1 = get, ms}; the firmware echoes the sequence number.
++ */
++#define BLUEJAY_APM_SRAM        0x02039000ULL
++#define BLUEJAY_APM_SRAM_SIZE   0x40000
++#define BLUEJAY_ACPM_INITDATA   0xa000
++#define BLUEJAY_AP2APM_MBOX     0x17610000ULL
++#define BLUEJAY_MBOX_INTGR1     0x40
++#define BLUEJAY_ACPM_DVFS_CHAN  0
++
++static inline uint32_t
++apm_rd(volatile uint8_t *base, uint64_t off)
++{
++	return *(volatile uint32_t *)(base + off);
++}
++
++static inline void
++apm_wr(volatile uint8_t *base, uint64_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++int
++SweetBattery::acpmDvfs(unsigned domain, unsigned khz, unsigned *out)
++{
++	if (fApmMap == NULL || fMboxMap == NULL) {
++		return -1;
++	}
++	volatile uint8_t *sram = (volatile uint8_t *)fApmMap->getVirtualAddress();
++	volatile uint8_t *mbox = (volatile uint8_t *)fMboxMap->getVirtualAddress();
++	uint32_t chan = BLUEJAY_ACPM_DVFS_CHAN;
++	if (apm_rd(sram, BLUEJAY_ACPM_INITDATA + 24) <= chan) {
++		return -2;
++	}
++	uint64_t ch = apm_rd(sram, BLUEJAY_ACPM_INITDATA + 8) + chan * 72;
++	uint32_t qlen = apm_rd(sram, ch + 52), mlen = apm_rd(sram, ch + 56);
++	uint64_t txr = apm_rd(sram, ch + 16), txf = apm_rd(sram, ch + 20), txb = apm_rd(sram, ch + 24);
++	uint64_t rxr = apm_rd(sram, ch + 40), rxf = apm_rd(sram, ch + 44), rxb = apm_rd(sram, ch + 48);
++	uint64_t limit = BLUEJAY_APM_SRAM_SIZE;
++	if (!qlen || qlen > 64 || mlen < 16 || mlen > 256 || ch + 72 > limit ||
++	    txr + 4 > limit || txf + 4 > limit || rxr + 4 > limit || rxf + 4 > limit ||
++	    txb + (uint64_t)qlen * mlen > limit || rxb + (uint64_t)qlen * mlen > limit) {
++		return -3;
++	}
++	uint32_t front = apm_rd(sram, txf), next = (front + 1) % qlen;
++	for (int i = 0; apm_rd(sram, txr) == next; i++) {
++		if (i > 100) {
++			return -4;              /* queue full */
++		}
++		IODelay(1000);
++	}
++	fAcpmSeq = (uint8_t)(fAcpmSeq % 63 + 1);
++	uint32_t cmd[4];
++	cmd[0] = (uint32_t)fAcpmSeq << 16 | (domain & 0xfff);
++	cmd[1] = khz;
++	cmd[2] = khz ? 0 : 1;
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	cmd[3] = (uint32_t)(ns / NSEC_PER_MSEC);
++	if (front >= qlen) {
++		return -5;
++	}
++	for (int i = 0; i < 4; i++) {
++		apm_wr(sram, txb + (uint64_t)mlen * front + 4 * i, cmd[i]);
++	}
++	__builtin_arm_dsb(0xf);         /* DSB SY */
++	apm_wr(sram, txf, next);
++	apm_wr(mbox, BLUEJAY_MBOX_INTGR1, 1u << chan);
++	for (int t = 0; t < 2000; t++) {        /* ~100 ms */
++		uint32_t i = apm_rd(sram, rxr), f = apm_rd(sram, rxf);
++		bool got = false;
++		uint32_t w1 = 0;
++		for (int n = 0; i != f && i < qlen && n < 64; n++) {
++			uint64_t m = rxb + (uint64_t)mlen * i;
++			if (((apm_rd(sram, m) >> 16) & 0x3f) == fAcpmSeq) {
++				got = true;
++				w1 = apm_rd(sram, m + 4);
++			}
++			i = (i + 1) % qlen;
++		}
++		apm_wr(sram, rxr, f);
++		if (got) {
++			if (out) {
++				*out = w1;
++			}
++			return 0;
++		}
++		IODelay(50);
++	}
++	return -6;                              /* no answer */
++}
++
++void
++SweetBattery::thermalStart(void)
++{
++	int on = 0;
++	if (!fBluejay || !PE_parse_boot_argn("sweetthermal", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	IOMemoryDescriptor *sram = IOMemoryDescriptor::withPhysicalAddress(BLUEJAY_APM_SRAM,
++	    BLUEJAY_APM_SRAM_SIZE, kIODirectionInOut);
++	IOMemoryDescriptor *mbox = IOMemoryDescriptor::withPhysicalAddress(BLUEJAY_AP2APM_MBOX,
++	    0x1000, kIODirectionInOut);
++	if (sram != NULL) {
++		fApmMap = sram->map(kIOMapInhibitCache);
++		sram->release();
++	}
++	if (mbox != NULL) {
++		fMboxMap = mbox->map(kIOMapInhibitCache);
++		mbox->release();
++	}
++	unsigned x1 = 0, a76 = 0;
++	int e = acpmDvfs(BLUEJAY_DVFS_CPUCL2, 0, &x1);
++	if (!e) {
++		e = acpmDvfs(BLUEJAY_DVFS_CPUCL1, 0, &a76);
++	}
++	/* The shim's boot request (shimcpu=1/2) is the full-speed level. */
++	fX1MaxKHz = x1 >= 1000000 && x1 <= 2802000 ? x1 : 2253000;
++	fThermal = e == 0;
++	fThermalLevel = 0;
++	IOLog("BLUEJAY THERMAL: %s, X1 %u kHz A76 %u kHz (error %d)\n",
++	    fThermal ? "on" : "unavailable", x1, a76, e);
++}
++
++void
++SweetBattery::thermalPoll(void)
++{
++	if (!fThermal) {
++		return;
++	}
++	unsigned next = bluejay_thermal_next(fThermalLevel, fTemperature);
++	if (next == fThermalLevel) {
++		return;
++	}
++	BluejayThermalLevel l = bluejay_thermal_clocks(next, fX1MaxKHz);
++	int e1 = acpmDvfs(BLUEJAY_DVFS_CPUCL2, l.x1_khz, NULL);
++	int e2 = acpmDvfs(BLUEJAY_DVFS_CPUCL1, l.a76_khz, NULL);
++	IOLog("BLUEJAY THERMAL: %d.%02d C level %u -> %u: X1 %u A76 %u kHz (errors %d %d)\n",
++	    fTemperature / 100, (fTemperature < 0 ? -fTemperature : fTemperature) % 100,
++	    fThermalLevel, next, l.x1_khz, l.a76_khz, e1, e2);
++	if (e1 == 0 && e2 == 0) {
++		fThermalLevel = next;
++	}
++}
++
+ void
+ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
  	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
  	if (self && self->fRunning) {
  		self->poll();
@@ -1051,7 +1247,7 @@ index 9969739..eed20eb 100644
  	}
  }
  
-@@ -264,7 +284,13 @@ SweetBattery::start(IOService *provider)
+@@ -264,7 +449,14 @@ SweetBattery::start(IOService *provider)
  	}
  	int real = 0;
  	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
@@ -1063,10 +1259,11 @@ index 9969739..eed20eb 100644
 +		/* Explicitly mark the initial source invalid until the first sample. */
 +		publish(100, 4200, 0, false, false, false, false, false, false);
 +	}
++	thermalStart();
  	/* Publish a complete source BEFORE registerService wakes powerd. */
  	poll();
  	if (fReal) {
-@@ -273,9 +299,10 @@ SweetBattery::start(IOService *provider)
+@@ -273,9 +465,10 @@ SweetBattery::start(IOService *provider)
  		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
  			fTimerAdded = true;
  			fRunning = true;
@@ -1915,6 +2112,77 @@ index c86b9e7..d6985b5 100644
  
  	if (disableConsoleOutput) {
  		return;
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..6a95baa 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -824,6 +824,66 @@ exception_triage(
+ #include <vm/vm_shared_region.h>
+ #include <arm/thread.h>
+ 
++/*
++ * sweetfix_posterboard=1 (user-approved test option): PosterBoard (iOS
++ * 16.7.16 20H392) races its own clients. A client asking for the switcher
++ * configuration before the first prewarm finishes makes
++ * -[PBFPosterExtensionDataStore _stateLock_switcherConfiguration] build one
++ * lazily; the prewarm's _stateLock_setupSwitcherConfigurationForFirstTime
++ * then asserts "!_stateLock_switcherConfiguration" (brk #0). The relaunched
++ * process is never prewarmed, so no wallpaper extension runs and every
++ * SpringBoard blur samples an empty wallpaper. The first-time setup rebuilds
++ * the configuration anyway: turn that one CBNZ into a NOP in PosterBoard's
++ * own copy-on-write view of the page, only if the original bytes match.
++ * This clears CS_KILL/CS_HARD for PosterBoard (as a debugger would).
++ * Called by exec with the new task's map switched in.
++ */
++#define SWEET_PB_ASSERT_VA      0x1c1777ab4ULL  /* unslid, cbnz x8, assert */
++#define SWEET_PB_ASSERT_INSN    0xb5003628u
++#define SWEET_ARM64_NOP         0xd503201fu
++extern int cs_allow_invalid(struct proc *p);
++void sweet_exec_fixup(struct proc *p, const char *name, task_t task);
++
++void
++sweet_exec_fixup(struct proc *p, const char *name, task_t task)
++{
++	int on = 0;
++	if (strcmp(name, "PosterBoard") != 0 ||
++	    !PE_parse_boot_argn("sweetfix_posterboard", &on, sizeof(on)) || on == 0) {
++		return;
++	}
++	vm_shared_region_t sr = vm_shared_region_get(task);
++	if (sr == NULL) {
++		printf("SWEET FIX: PosterBoard has no shared region\n");
++		return;
++	}
++	uint64_t slide = sr->sr_slide;
++	vm_shared_region_deallocate(sr);
++	user_addr_t va = (user_addr_t)(SWEET_PB_ASSERT_VA + slide);
++	uint32_t insn = 0;
++	if (copyin(va, &insn, sizeof(insn)) != 0 || insn != SWEET_PB_ASSERT_INSN) {
++		printf("SWEET FIX: PosterBoard 0x%llx is 0x%x, not the expected build: skipped\n",
++		    (uint64_t)va, insn);
++		return;
++	}
++	if (!cs_allow_invalid(p)) {
++		printf("SWEET FIX: PosterBoard: code-signing policy refused, skipped\n");
++		return;
++	}
++	vm_map_t map = get_task_map(task);
++	vm_map_offset_t page = vm_map_trunc_page(va, vm_map_page_mask(map));
++	vm_map_offset_t end = page + vm_map_page_size(map);
++	kern_return_t kr = vm_map_protect(map, page, end,
++	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE | VM_PROT_COPY, FALSE);
++	uint32_t nop = SWEET_ARM64_NOP;
++	int err = kr == KERN_SUCCESS ? copyout(&nop, va, sizeof(nop)) : -1;
++	kern_return_t kr2 = vm_map_protect(map, page, end, VM_PROT_READ | VM_PROT_EXECUTE, FALSE);
++	uint32_t check = 0;
++	(void)copyin(va, &check, sizeof(check));
++	printf("SWEET FIX: PosterBoard first-time setup assert at 0x%llx: protect %d write %d restore %d now 0x%x\n",
++	    (uint64_t)va, kr, err, kr2, check);
++}
++
+ /*
+  * SWEET crash report on the console. The phone has no way to get crash
+  * logs off the device, and corpses stop after a few crashes, so print what
 diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
 index 9cdaf06..cf4c03b 100644
 --- a/pexpert/arm/pe_serial.c
@@ -2195,6 +2463,60 @@ index 0000000..c9e70f6
 + s->charging=s->external && (details2&0x20) && state<=3;
 + s->full=s->external && state==4;
 + return true;
++}
++#endif
+diff --git a/iokit/Kernel/arm/BluejayThermal.h b/iokit/Kernel/arm/BluejayThermal.h
+new file mode 100644
+index 0000000..e508cfa
+--- /dev/null
++++ b/iokit/Kernel/arm/BluejayThermal.h
+@@ -0,0 +1,48 @@
++/* CPU clock policy from the battery thermistor, shared with host checks. */
++#ifndef BLUEJAY_THERMAL_H
++#define BLUEJAY_THERMAL_H
++
++/* ACPM DVFS domains (mainline google,gs101-acpm.h). */
++#define BLUEJAY_DVFS_CPUCL1     3       /* 2 x Cortex-A76 */
++#define BLUEJAY_DVFS_CPUCL2     4       /* 2 x Cortex-X1 */
++
++struct BluejayThermalLevel {
++	unsigned a76_khz, x1_khz;
++};
++
++/* Level 0 = full speed (X1 at the boot-arg maximum), 1 = warm, 2 = hot. */
++static inline BluejayThermalLevel
++bluejay_thermal_clocks(unsigned level, unsigned x1_max_khz)
++{
++	BluejayThermalLevel l;
++	l.a76_khz = level >= 2 ? 1803000u : 2253000u;
++	l.x1_khz = level >= 2 ? 1803000u : level == 1 ? 2253000u : x1_max_khz;
++	if (l.x1_khz > x1_max_khz) {
++		l.x1_khz = x1_max_khz;
++	}
++	return l;
++}
++
++/*
++ * Battery temperature in 0.01 C. Step up at 40 / 44 C, back down only below
++ * 42 / 38 C so the clocks do not oscillate around one threshold. An invalid
++ * reading (outside -20..80 C) is treated as hot.
++ */
++static inline unsigned
++bluejay_thermal_next(unsigned level, int centi_c)
++{
++	if (centi_c < -2000 || centi_c > 8000 || centi_c >= 4400) {
++		return 2;
++	}
++	if (centi_c >= 4000) {
++		return level >= 2 && centi_c >= 4200 ? 2 : 1;
++	}
++	if (level >= 2) {
++		return centi_c >= 4200 ? 2 : 1;
++	}
++	if (level == 1) {
++		return centi_c >= 3800 ? 1 : 0;
++	}
++	return 0;
 +}
 +#endif
 diff --git a/iokit/Kernel/arm/SweetSurfaceFormat.h b/iokit/Kernel/arm/SweetSurfaceFormat.h
