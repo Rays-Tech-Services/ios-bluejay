@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package a rebuilt kernel with the thermal and PosterBoard opt-in fixes.
+"""Package a rebuilt kernel with the thermal, PosterBoard, and synchronized display fixes.
 
 Requires a phone boot image as the source of the ADT and existing XNU flags,
 and stock boot metadata via --like. Never boots or flashes the phone.
@@ -17,11 +17,13 @@ import repayload
 
 
 def command_line(old):
-    flags = {'sweetbattery': '2', 'sweetthermal': '1', 'sweetfix_posterboard': '1'}
+    flags = {'sweetbattery': '2', 'sweetthermal': '1', 'sweetfix_posterboard': '1',
+             'sweetfb_te': '1', 'sweetfb_native': '1'}
     words = old.split()
     if any(w.startswith('rd=md') for w in words):
         raise ValueError('use a phone UFS boot image, not a ramdisk image')
-    words = [w for w in words if w.split('=', 1)[0] not in flags]
+    words = [w for w in words if w.split('=', 1)[0] not in flags
+             and w.split('=', 1)[0] not in ('sweetfb_lw', 'sweetfb_lh')]
     words.extend(f'{key}={value}' for key, value in flags.items())
     line = ' '.join(words)
     if len(line.encode()) >= mkpayload.BOOT_LINE_LENGTH:

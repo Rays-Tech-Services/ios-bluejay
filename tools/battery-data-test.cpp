@@ -19,5 +19,15 @@ int main() {
  assert(!decode(50*256,0xffff,25*256,0x40,1,0x20));
  assert(!decode(50*256,0,25*256,0x40,1,0x20));
  assert(!decode(50*256,51200,0x7fff,0x40,1,0x20));
+ /* A charger I2C failure must not freeze the gauge or fabricate unplugging. */
+ assert(decode(80*256,51200,25*256,0x40,1,0x20));
+ assert(bluejay_battery_decode(0x4040,42*256,49920,30*256,0,0,0,&s,false));
+ assert(s.percent==42 && s.mv==3900 && s.temperature==3000);
+ assert(s.external && s.charging && !s.full);
+ /* When charger reads recover, publish a real unplug transition. */
+ assert(decode(41*256,49920,30*256,0,8,0));
+ assert(!s.external && !s.charging);
+ assert(!bluejay_battery_decode(0x4040,0xffff,49920,30*256,0,0,0,&s,false));
+ assert(s.percent==41);
  assert(!bluejay_battery_decode(0xffff,12800,51200,6400,0x40,1,0x20,&s));
 }

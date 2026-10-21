@@ -11,12 +11,14 @@ spec.loader.exec_module(package)
 
 class FlagsTest(unittest.TestCase):
     def test_enable_and_replace(self):
-        line = package.command_line('rd=ufsroot0 cpus=8 sweetbattery=0 sweetthermal=0 sweetfix_posterboard=0 sweetthermal=0')
+        line = package.command_line('rd=ufsroot0 cpus=8 sweetbattery=0 sweetthermal=0 sweetfix_posterboard=0 sweetthermal=0 sweetfb_te=0 sweetfb_te=0 sweetfb_native=0 sweetfb_lw=828 sweetfb_lh=1792')
         words = line.split()
         self.assertIn('cpus=8', words)
-        for flag in ('sweetbattery=2', 'sweetthermal=1', 'sweetfix_posterboard=1'):
+        for flag in ('sweetbattery=2', 'sweetthermal=1', 'sweetfix_posterboard=1', 'sweetfb_te=1', 'sweetfb_native=1'):
             self.assertEqual(words.count(flag), 1)
         self.assertNotIn('sweetthermal=0', words)
+        self.assertNotIn('sweetfb_te=0', words)
+        self.assertFalse(any(w.startswith(('sweetfb_lw=', 'sweetfb_lh=')) for w in words))
         self.assertEqual(package.command_line(line), line)
 
     def test_ramdisk_rejected(self):
