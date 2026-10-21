@@ -120,3 +120,19 @@ has addNetworkInterface -x -s with IOKit launch event and controller allowlist
 including IOUserNetworkEthernet. New discovery adapter targets this.
 Packet proof is local only: no default route/DNS or internet verified yet.
 Live capture received 196212 bytes (out/usb-battery-live.log, private).
+
+User said sharing setup done and phone was in fastboot. Temporarily booted
+out/phone-ios-usb-network/boot.img successfully. USB came up after ~1 minute;
+en5 static 192.168.7.1 applied; 3/3 ping to 192.168.7.2, avg1.612ms.
+Live out/usb-network-live.log shows exec configd and exec addNetworkInterface:
+new IOKit discovery triggers Apple's native setup job. Native DHCP/routing
+completion not confirmed yet. Need ask whether Ethernet now appears in iOS.
+
+Mac version27.0.1. Correct daemon label is com.apple.NetworkSharing (NOT
+com.apple.InternetSharing). launchctl print shows not running, activecount0,
+runs0. com.apple.nat.plist NAT Enabled=0 and SharingDevices=[], no bridge100,
+bootpd DHCP off. Thus sharing not enabled despite user's "done"; need user's
+Sharing panel screenshot or actual On switch + Sweet iOS destination selection.
+CUA previously very slow/failed; avoid blind retries. tcpdump BPF denied;
+sudo requires password; no root bypass attempted. net.inet.ip.forwarding=1
+is pre-existing observed state. Installed working boot remains unchanged.
