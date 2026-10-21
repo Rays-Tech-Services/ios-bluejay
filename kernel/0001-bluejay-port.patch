@@ -636,7 +636,7 @@ index 53e5095..6d5def7 100644
  probed:
  	lck_mtx_unlock(&sweet_ufs_lock);
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index b6c1a41..1dd3dc1 100644
+index b6c1a41..58ae9dc 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -21,6 +21,7 @@
@@ -680,7 +680,33 @@ index b6c1a41..1dd3dc1 100644
  		return;
  	}
  	vm_offset_t gcc = ml_io_map(GCC_PA, GCC_SIZE);
-@@ -460,6 +485,8 @@ ud_setup(void)
+@@ -181,6 +206,7 @@ sweet_usb_probe(void)
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
++#define DEPCMD_ENDTRANSFER      8
+ #define DEPCMD_STARTTRANSFER    6
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
+@@ -225,6 +251,8 @@ static struct {
+ 	uint32_t    evt_pos;
+ 	int         sleep_chan;
+ 	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
++	uint8_t     resource[32];   /* active transfer resource indices */
++	bool        pixel;
+ 	bool        data_in;        /* data stage direction */
+ 	uint32_t    events;
+ 	bool        configured;
+@@ -281,6 +309,8 @@ ud_epcmd(unsigned ep, uint32_t cmd, uint32_t p0, uint32_t p1, uint32_t p2)
+ 				printf("SWEET USB: ep%u cmd 0x%x status %u\n", ep, cmd & 0xf, status);
+ 				return -1;
+ 			}
++			if ((cmd & 0xf) == DEPCMD_STARTTRANSFER) ud.resource[ep] = (uint8_t)((v >> 16) & 0x7f);
++			if ((cmd & 0xf) == DEPCMD_ENDTRANSFER) ud.resource[ep] = 0;
+ 			return 0;
+ 		}
+ 		delay(1);
+@@ -460,6 +490,8 @@ ud_setup(void)
  			if (value == 1 && ud.configured) {
  				ud_notify_connected();
  				ud_link_event(true);
@@ -689,7 +715,7 @@ index b6c1a41..1dd3dc1 100644
  			}
  		}
  	} else if (req == 10) {         /* GET_INTERFACE */
-@@ -536,7 +563,7 @@ ud_rx_done(void)
+@@ -536,7 +568,7 @@ ud_rx_done(void)
  static void
  ud_tx_kick_locked(void)
  {
@@ -698,7 +724,7 @@ index b6c1a41..1dd3dc1 100644
  		mbuf_t m = ud.txq[ud.txq_head];
  		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
  		ud.txq_count--;
-@@ -562,7 +589,7 @@ static errno_t
+@@ -562,7 +594,7 @@ static errno_t
  ud_if_output(ifnet_t ifp, mbuf_t m)
  {
  	lck_mtx_lock(ud.lock);
@@ -707,7 +733,16 @@ index b6c1a41..1dd3dc1 100644
  		lck_mtx_unlock(ud.lock);
  		mbuf_freem(m);
  		ifnet_stat_increment_out(ifp, 0, 0, 1);
-@@ -601,9 +628,9 @@ ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+@@ -584,6 +616,8 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ static void
+ ud_link_event(bool up)
+ {
++	extern void sweet_usb_registry_link(int active);
++	if (ud.pixel) sweet_usb_registry_link(up);
+ 	if (ud.ifp != NULL) {
+ 		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
+ 	}
+@@ -601,9 +635,9 @@ ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
  		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
  		int media = IFM_ETHER | IFM_AUTO;
  		ifmr->ifm_current = media;
@@ -719,10 +754,36 @@ index b6c1a41..1dd3dc1 100644
  		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
  			ifmr->ifm_count = 1;
  			return copyout(&media, list, sizeof(media));
-@@ -704,12 +731,29 @@ ud_if_create(void)
- 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
- }
- 
+@@ -645,7 +679,7 @@ ud_if_create(void)
+ 	init.flags = IFNET_INIT_LEGACY;
+ 	init.uniqueid = "sweet-usb-ecm";
+ 	init.uniqueid_len = sizeof("sweet-usb-ecm") - 1;
+-	init.name = "ue";
++	init.name = ud.pixel ? "en" : "ue";
+ 	init.unit = 0;
+ 	init.family = IFNET_FAMILY_ETHERNET;
+ 	init.type = IFT_ETHER;
+@@ -684,7 +718,7 @@ ud_if_create(void)
+ 	if (err == 0) {
+ 		struct ifaliasreq ifra;
+ 		bzero(&ifra, sizeof(ifra));
+-		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "ue0");
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "%s0", ud.pixel ? "en" : "ue");
+ 		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
+ 		a->sin_len = sizeof(*a);
+ 		a->sin_family = AF_INET;
+@@ -701,7 +735,44 @@ ud_if_create(void)
+ 		sock_close(so);
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+-	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++	printf("SWEET USB: %s0 192.168.7.2/24 %s (err %d)\n", ud.pixel ? "en" : "ue", err ? "NOT configured" : "up", err);
++	if (ud.pixel && err == 0) {
++		extern void sweet_usb_publish_interface(const unsigned char *mac);
++		sweet_usb_publish_interface(ud_phone_mac);
++	}
++}
++
 +static void
 +ud_reset_link(void)
 +{
@@ -736,12 +797,28 @@ index b6c1a41..1dd3dc1 100644
 +		ud.txq_count--;
 +	}
 +	lck_mtx_unlock(ud.lock);
++	/* USB reset cancels pending bulk transfers. Release their hardware
++	 * resources as well as the software queue before reconfiguration. */
++	const unsigned data_eps[] = { EP_RX, EP_TX, EP_INT };
++	for (unsigned i = 0; i < sizeof(data_eps)/sizeof(data_eps[0]); i++) {
++		unsigned ep = data_eps[i];
++		if (ud.resource[ep]) (void)ud_epcmd(ep, DEPCMD_ENDTRANSFER | (1u << 11) |
++		    ((uint32_t)ud.resource[ep] << 16), 0, 0, 0);
++	}
++	/* If unplugged during a control DATA/STATUS stage, the next host
++	 * needs a SETUP TRB, not the stale stage. Follow DWC3 ep0 reset. */
++	if (ud.state != EP0_SETUP) {
++		for (unsigned ep = 0; ep < 2; ep++) {
++			if (ud.resource[ep]) (void)ud_epcmd(ep, DEPCMD_ENDTRANSFER | (1u << 11) |
++			    ((uint32_t)ud.resource[ep] << 16), 0, 0, 0);
++		}
++		ud_stall();
++	}
 +	ud_link_event(false);
-+}
-+
+ }
+ 
  static void
- ud_event(uint32_t ev)
- {
+@@ -710,6 +781,7 @@ ud_event(uint32_t ev)
  	if (ev & 1) {                   /* device event */
  		uint32_t type = (ev >> 8) & 0xf;
  		if (type == 1) {        /* USB reset */
@@ -749,7 +826,7 @@ index b6c1a41..1dd3dc1 100644
  			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
  			printf("SWEET USB: bus reset\n");
  		} else if (type == 2) { /* connect done */
-@@ -721,6 +765,7 @@ ud_event(uint32_t ev)
+@@ -721,6 +793,7 @@ ud_event(uint32_t ev)
  			    (1u << 8) | (1u << 10) | (1u << 25), 0);
  			printf("SWEET USB: connected, speed %u\n", speed);
  		} else if (type == 0) {
@@ -757,7 +834,16 @@ index b6c1a41..1dd3dc1 100644
  			printf("SWEET USB: disconnect\n");
  		}
  		return;
-@@ -884,6 +929,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -854,6 +927,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	thread_t thread;
+ 
+ 	ud.dwc = dwc;
++	DTEntry pixel_identity;
++	ud.pixel = SecureDTLookupEntry(NULL, "/bluejay", &pixel_identity) == kSuccess;
+ 	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET USB: no DMA memory\n");
+@@ -884,6 +959,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
  	ud.evt_pos = 0;
  
@@ -770,7 +856,7 @@ index b6c1a41..1dd3dc1 100644
  	/* High speed, address 0 */
  	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
  	dwc_wr(DCFG, dcfg | 0);
-@@ -902,7 +953,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -902,7 +983,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	dwc_wr(DALEPENA, 0x3);
  	ud_start_setup();
  
@@ -925,6 +1011,16 @@ index 9969739..eed20eb 100644
  			poll();
  			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
  		}
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..8e92823 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -79,4 +79,5 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+  * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
+  * is what the iPhone userland (MobileGestalt) expects.
+  */
++#include "SweetUSBNetwork.h"
+ #endif /* SWEET */
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index 44f005f..87e9a13 100644
 --- a/makedefs/MakeInc.def
@@ -1370,3 +1466,81 @@ index 0000000..c9e70f6
 + return true;
 +}
 +#endif
+diff --git a/iokit/Kernel/arm/SweetUSBNetwork.h b/iokit/Kernel/arm/SweetUSBNetwork.h
+new file mode 100644
+index 0000000..ed61ae1
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetUSBNetwork.h
+@@ -0,0 +1,72 @@
++/*
++ * Minimal IOKit discovery adapter for the built-in USB ifnet.
++ * Packet I/O remains entirely in sweet_usb.c. XNU here has no separately
++ * linked IONetworkingFamily: these services publish its discovery shape so
++ * iOS addNetworkInterface / SystemConfiguration can create an Ethernet
++ * service, run DHCP, and install route/DNS state. No user-client ABI is
++ * claimed or implemented. SelfNamed means the BSD interface already exists.
++ * Property consumers: Apple's configd SCNetworkInterface.c.
++ */
++#include <IOKit/IOService.h>
++#include <libkern/c++/OSData.h>
++
++class IOUserNetworkEthernet : public IOService {
++ OSDeclareDefaultStructors(IOUserNetworkEthernet);
++};
++OSDefineMetaClassAndStructors(IOUserNetworkEthernet, IOService);
++class IONetworkInterface : public IOService {
++ OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, IOService);
++
++static IOUserNetworkEthernet *sweet_usb_controller;
++static IONetworkInterface *sweet_usb_interface;
++extern "C" void sweet_usb_publish_interface(const unsigned char *mac);
++extern "C" void sweet_usb_registry_link(int active);
++
++extern "C" void
++sweet_usb_publish_interface(const unsigned char *mac)
++{
++ if (sweet_usb_interface) return;
++ IOService *provider = IOService::getResourceService();
++ IOUserNetworkEthernet *controller = new IOUserNetworkEthernet;
++ IONetworkInterface *interface = new IONetworkInterface;
++ if (!provider || !controller || !interface) goto fail;
++ if (!controller->init() || !interface->init()) goto fail;
++ controller->setName("PixelUSBEthernet");
++ controller->setProperty("IOMACAddress", (void *)mac, 6);
++ controller->setProperty("SelfNamed", true);
++ controller->setProperty("IOBuiltin", false);
++ controller->setProperty("IOLinkStatus", (unsigned long long)1, 32);
++ controller->setProperty("IOLinkSpeed", (unsigned long long)480000000, 64);
++ if (!controller->attach(provider)) goto fail;
++ if (!controller->start(provider)) { controller->detach(provider); goto fail; }
++ interface->setName("en0");
++ interface->setProperty("IOBSDName", "en0");
++ interface->setProperty("IOInterfaceNamePrefix", "en");
++ interface->setProperty("IOInterfaceUnit", (unsigned long long)0, 32);
++ interface->setProperty("IOInterfaceType", (unsigned long long)6, 32);
++ interface->setProperty("IOBuiltin", false);
++ interface->setProperty("IOPrimaryInterface", true);
++ interface->setProperty("IOMACAddress", (void *)mac, 6);
++ if (!interface->attach(controller)) { controller->stop(provider); controller->detach(provider); goto fail; }
++ if (!interface->start(controller)) { interface->detach(controller); controller->stop(provider); controller->detach(provider); goto fail; }
++ sweet_usb_controller = controller;
++ sweet_usb_interface = interface;
++ controller->registerService();
++ interface->registerService();
++ IOLog("SWEET USB: IOKit Ethernet discovery registered for en0 / DHCP\n");
++ return;
++fail:
++ if (interface) interface->release();
++ if (controller) controller->release();
++ IOLog("SWEET USB: IOKit Ethernet discovery failed\n");
++}
++
++extern "C" void
++sweet_usb_registry_link(int active)
++{
++ if (sweet_usb_controller) {
++  sweet_usb_controller->setProperty("IOLinkStatus", (unsigned long long)(active ? 3 : 1), 32);
++ }
++}

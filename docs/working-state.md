@@ -93,3 +93,9 @@ Then USB device disappeared. Ping failed and UDP log bind found no local
 address. Async question asks whether user unplugged, iOS running connected,
 or phone crashed. Need answer/photo before blaming driver. Battery UI not
 yet confirmed. No internet sharing, forwarding, NAT, DNS configured.
+
+User confirmed 99% and charging/unplugged changes in iOS. USB disappeared
+because they unplugged; replug failed. Fresh v2 temporary boot: 3/3 ping
+succeeded and live UDP logs captured. User says no Ethernet in Settings.
+Preparing IOKit interface discovery bridge / en0 for native iOS DHCP and
+DWC3 active-transfer / EP0 reset handling. Mac Internet Sharing still off.

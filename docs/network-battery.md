@@ -101,3 +101,27 @@ The new Sweet iOS network service was changed from DHCP to manual
 192.168.7.1/24, no router. USB disconnected before packet tests completed.
 Ping did not succeed; no kernel logs were captured. Awaiting whether user
 unplugged or phone/driver disconnected. No NAT/forwarding/DNS changes made.
+
+## Confirmed follow-up / active internet work
+
+User confirmed iOS displays 99% and changes charging/unplugged status when
+the cable is removed/reinserted. Battery UI goal achieved on the temporary
+image; working installed image still has its previous static battery service.
+The USB disappearance was user unplugging. Reconnect did not enumerate again.
+Fresh temporary boot with cable left attached: Mac en5 reappeared, static
+192.168.7.1 applied, 3/3 pings to 192.168.7.2 succeeded (2.4–5.1 ms), and
+UDP kernel logging works (`out/usb-battery-live.log`, local/private).
+User reports no Ethernet entry in iOS Settings. Existing cached Apple job
+com.apple.usb.networking.addNetworkInterface waits for IONetworkInterface
+with supported controller metadata; the old driver only published a BSD ifnet.
+
+Next kernel experiment adds a minimal IOKit discovery adapter with self-named
+en0, IFT_ETHER type, MAC and a supported IOUserNetworkEthernet controller
+identity. This is discovery metadata, not a complete IONetworkingFamily or
+DriverKit implementation; no user-client ABI. Apple's SCNetworkInterface.c
+reads these properties; whether the iOS job successfully creates the DHCP
+service still requires hardware verification. Pixel BSD interface becomes en0;
+other boards retain ue0. No default route or DNS is hardcoded.
+Also track DWC3 transfer resource IDs, end data transfers on reset/disconnect,
+and rearm EP0 if interrupted mid control transfer, following upstream DWC3.
+This is an attempted reconnect fix, not hardware verified yet.
