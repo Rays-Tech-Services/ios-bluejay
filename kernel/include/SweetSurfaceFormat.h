@@ -29,6 +29,17 @@ sweet_surface_web_bgra(bool enabled, const char *process, unsigned format,
 	       sweet_surface_is_web_process(process);
 }
 
+/*
+ * WebKit's GPU process falls back to CPU CGBitmapContext buffers when
+ * IOSurfaceCreate fails. Its IOSurface-backed contexts draw through
+ * QuartzCore's accelerated CG queue, which left every traced page tile zero.
+ */
+static inline bool
+sweet_surface_web_cpu(bool enabled, const char *process, unsigned parent)
+{
+	return enabled && parent == 0 && sweet_surface_is_web_process(process);
+}
+
 struct SweetSurfaceBGRALayout {
 	unsigned rowBytes, allocSize;
 };

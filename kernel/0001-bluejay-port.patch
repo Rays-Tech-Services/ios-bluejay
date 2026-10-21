@@ -1103,7 +1103,7 @@ index 0631685..8e92823 100644
 +#include "SweetUSBNetwork.h"
  #endif /* SWEET */
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 7f90c56..5b2d5bf 100644
+index 7f90c56..e79f153 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -39,6 +39,9 @@
@@ -1235,7 +1235,7 @@ index 7f90c56..5b2d5bf 100644
  	SweetSurfaceRef *ref = NULL;
  	bool existing = false;
  	IOReturn ret = addRef(s, &ref, &existing);
-@@ -684,6 +748,34 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -684,6 +748,47 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  	}
  	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
  	ret = sweet_surface_layout(s, props);
@@ -1244,11 +1244,24 @@ index 7f90c56..5b2d5bf 100644
 +	 * that path a complete BGRA layout, before allocation or painting, rather
 +	 * than trying to interpret already-painted RGB10 pixels as BGRA. Do not
 +	 * alter other clients, child surfaces, or their requested formats. */
-+	int webBGRA = 0;
++	int webBGRA = 0, webCPU = 0;
 +	char creator[32];
 +	proc_selfname(creator, sizeof(creator));
 +	s->webTrace = sweet_surface_web_trace && sweet_surface_is_web_process(creator);
 +	PE_parse_boot_argn("sweetweb_bgra", &webBGRA, sizeof(webBGRA));
++	PE_parse_boot_argn("sweetweb_cpu", &webCPU, sizeof(webCPU));
++	/* Diagnostic, off by default: refuse WebKit's IOSurfaces so it paints
++	 * into CPU bitmaps instead of QuartzCore's accelerated CG queue. */
++	if (ret == kIOReturnSuccess && sweet_surface_web_cpu(webCPU != 0, creator, s->parentID)) {
++		static uint32_t refusals;
++		if (OSIncrementAtomic((volatile SInt32 *)&refusals) < 32) {
++			IOLog("SWEET SURF: %s CPU bitmap fallback, refused %ux%u fmt 0x%x\n",
++			    creator, s->width, s->height, s->pixelFormat);
++		}
++		props->release();
++		s->release();
++		return kIOReturnUnsupported;
++	}
 +	if (ret == kIOReturnSuccess &&
 +	    sweet_surface_web_bgra(webBGRA != 0, creator, s->pixelFormat, s->parentID)) {
 +		SweetSurfaceBGRALayout layout;
@@ -1270,7 +1283,7 @@ index 7f90c56..5b2d5bf 100644
  	if (ret == kIOReturnSuccess) {
  		IOBufferMemoryDescriptor *mem = NULL;
  		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
-@@ -727,6 +819,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -727,6 +832,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
      __unused void *reference)
  {
  	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
@@ -1282,7 +1295,7 @@ index 7f90c56..5b2d5bf 100644
  
  	switch (selector) {
  	case kSweetSurfaceLimits: {
-@@ -767,6 +864,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -767,6 +877,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  			return kIOReturnNotFound;
  		}
  		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
@@ -1290,7 +1303,7 @@ index 7f90c56..5b2d5bf 100644
  		args->scalarOutputCount = 1;
  		s->release();
  		sweet_surf_log_once("sel", selector);
-@@ -830,6 +928,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+@@ -830,6 +941,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
  		return kIOReturnNotFound;
  	}
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
@@ -1298,7 +1311,7 @@ index 7f90c56..5b2d5bf 100644
  	s->release();
  	return ret;
  }
-@@ -844,6 +943,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+@@ -844,6 +956,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
  	}
  	IOReturn ret = sweet_surface_seed_out(s, seedOut,
  	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
@@ -1776,10 +1789,10 @@ index 0000000..c9e70f6
 +#endif
 diff --git a/iokit/Kernel/arm/SweetSurfaceFormat.h b/iokit/Kernel/arm/SweetSurfaceFormat.h
 new file mode 100644
-index 0000000..5fc255d
+index 0000000..2d7a91c
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurfaceFormat.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,65 @@
 +/* Geometry policy shared by the kernel and the host-side checks. */
 +#ifndef SWEET_SURFACE_FORMAT_H
 +#define SWEET_SURFACE_FORMAT_H
@@ -1809,6 +1822,17 @@ index 0000000..5fc255d
 +	return enabled && parent == 0 &&
 +	       (format == SWEET_FORMAT_RGB10 || format == SWEET_FORMAT_RGB10A8) &&
 +	       sweet_surface_is_web_process(process);
++}
++
++/*
++ * WebKit's GPU process falls back to CPU CGBitmapContext buffers when
++ * IOSurfaceCreate fails. Its IOSurface-backed contexts draw through
++ * QuartzCore's accelerated CG queue, which left every traced page tile zero.
++ */
++static inline bool
++sweet_surface_web_cpu(bool enabled, const char *process, unsigned parent)
++{
++	return enabled && parent == 0 && sweet_surface_is_web_process(process);
 +}
 +
 +struct SweetSurfaceBGRALayout {

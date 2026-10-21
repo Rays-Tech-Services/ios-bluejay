@@ -72,3 +72,36 @@ already used the same selector. No missing method is newly advertised as
 implemented. The diagnostic is off by default and does not change page data,
 rendering formats, or synchronization. Host sanitizer checks cover transparent,
 opaque black, colored, padded/offset and short/out-of-bounds buffers.
+
+## Trace result: WebKit tiles are never painted
+
+`out/webkit-trace-phone.log` (sweetweb_bgra=1 sweetweb_trace=1, local /plain
+page loaded): all 13 WebKit GPU-process surfaces (ids 15-17, 19-21, 25-27;
+1125x1536 tiles and smaller) were sampled up to 30 times each over a minute.
+Every sample: nonzero 0, rgb 0, alpha 0. Each surface had exactly one GPU lock
+and one write unlock (seed 0 -> 1), was exported by mach port, then mapped and
+read-locked by backboardd. The compositor handoff works; the content does not
+exist. Black (BGRA policy) and white (RGB10, presumably skipped by the software
+compositor so Safari's background shows) are two views of the same empty tiles.
+
+WebKit draws into these surfaces with `CGIOSurfaceContextCreate`, which is
+QuartzCore's accelerated CG queue (`CA::CG::AccelRenderer::acquire`). That
+tries `CAMetalContextCreate` first; without Metal it builds a `CA::OGL::SWContext`
+and locks the surface for a CPU destination. Its destination setup switches on
+the drawable format (1-10 and 0x12); several formats get a NULL base address,
+and why the BGRA case also yields no pixels is not established. Unlike the rest
+of the UI (CGBitmapContext + backboardd), this path is used only by WebKit here.
+
+## Next test: `sweetweb_cpu=1`
+
+Matching WebKit source (`RemoteRenderingBackend::createImageBufferWithQualifiedIdentifier`)
+falls back to `UnacceleratedImageBufferShareableBackend` (a CPU CGBitmapContext
+on shared memory) whenever the accelerated IOSurface buffer cannot be created.
+`sweetweb_cpu=1` makes IOSurface creation fail for parentless requests from the
+exact WebKit GPU/WebContent processes (first 32 refusals logged as `CPU bitmap
+fallback`). No other process is affected; off by default. Deep-colour tiles then
+become half-float CPU bitmaps (extended sRGB); backboardd's software renderer
+must display those as layer contents, which is unverified. If the page renders,
+QuartzCore's IOSurface CG queue is the culprit; if it stays blank, WebKit's
+painting itself is not reaching any buffer. Host check: `tools/surface-format-test.cpp`.
+Test without sweetweb_bgra (it is irrelevant once WebKit surfaces are refused).

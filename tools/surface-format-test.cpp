@@ -14,6 +14,13 @@ int main()
 	assert(!sweet_surface_web_bgra(true, "com.apple.WebKit.GPU.fake", SWEET_FORMAT_RGB10, 0));
 	assert(!sweet_surface_web_bgra(true, "com.apple.WebKit.GPU", SWEET_FORMAT_BGRA, 0));
 	assert(!sweet_surface_web_bgra(true, "com.apple.WebKit.GPU", SWEET_FORMAT_RGB10A8, 5));
+	assert(sweet_surface_web_cpu(true, "com.apple.WebKit.GPU", 0));
+	assert(sweet_surface_web_cpu(true, "com.apple.WebKit.WebContent", 0));
+	assert(!sweet_surface_web_cpu(false, "com.apple.WebKit.GPU", 0));
+	assert(!sweet_surface_web_cpu(true, "MobileSafari", 0));
+	assert(!sweet_surface_web_cpu(true, "backboardd", 0));
+	assert(!sweet_surface_web_cpu(true, "com.apple.WebKit.GPU.fake", 0));
+	assert(!sweet_surface_web_cpu(true, "com.apple.WebKit.GPU", 5));
 	SweetSurfaceBGRALayout l;
 	assert(sweet_surface_bgra_layout(1125, 1536, 16384, &l));
 	assert(l.rowBytes == 4544 && l.allocSize == 6979584);
