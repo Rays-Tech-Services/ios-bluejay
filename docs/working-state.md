@@ -72,3 +72,24 @@ kernel ID guard (old test kernel rejects this ID without starting USB).
 Need new CI artifact before iOS USB/battery hardware test; do not use old
 USB test kernel expecting enumeration. Photo contains raw observations in
 `out/usb-battery-test-state.json` (local). No installed image changed.
+
+User returned phone to fastboot for combined iOS test. Corrected DWC3.1 CI
+run 39533700976 (commit 9fc2c82) is in progress; fetch worker session 20813
+will download to out/ci-usb-battery-v2 after success. Do not boot the stale
+combined test image until repacked with this new artifact.
+
+Corrected kernel CI 39533700976 succeeded. SHA256
+cd93feacaa32f774814984f62974ae3a9da8a55c4159f798c070916dbb22973d.
+Downloaded out/ci-usb-battery-v2, packed out/phone-ios-usb-battery-v2/boot.img.
+Temporary fastboot boot returned OKAY; testing eight cores with sweetusb=2
+and sweetbattery=2. No installed boot/root partitions flashed. Awaiting iOS
+battery result and Mac USB enumeration.
+
+Combined temporary boot: USB enumerated correctly on Mac, AppleUserECMData
+and AppleUserECM matched and en5 appeared. networksetup permanent host MAC
+correct; ifconfig current MAC temporarily zero-like. Helper now handles this.
+Set only new Sweet iOS USB service to manual 192.168.7.1/24, no router.
+Then USB device disappeared. Ping failed and UDP log bind found no local
+address. Async question asks whether user unplugged, iOS running connected,
+or phone crashed. Need answer/photo before blaming driver. Battery UI not
+yet confirmed. No internet sharing, forwarding, NAT, DNS configured.

@@ -2,7 +2,7 @@
 """Find the Pixel CDC-ECM interface on macOS; optionally bring up its local link.
 
 Default is read-only. --configure-link changes only the interface with our exact
-locally administered host MAC. This establishes a local link, not internet sharing.
+locally administered permanent host MAC. This establishes a local link, not internet sharing.
 --listen prints the phone's UDP kernel log (192.168.7.2 -> host port 5140).
 """
 import argparse
@@ -22,13 +22,21 @@ def find_pixel(text):
         mac = re.search(r'^\s+ether\s+([0-9a-f:]{17})\s*$', section, re.M | re.I)
         if name and mac and mac[1].lower() == PIXEL_MAC:
             matches.append(name[1])
+    # DriverKit can expose a temporary current MAC in ifconfig while the
+    # permanent ECM descriptor MAC is correctly reported by networksetup.
+    for section in re.split(r'(?=^Hardware Port: )', text, flags=re.M):
+        name = re.search(r'^Device: ([A-Za-z][A-Za-z0-9]*)$', section, re.M)
+        mac = re.search(r'^Ethernet Address: ([0-9a-f:]{17})$', section, re.M | re.I)
+        if name and mac and mac[1].lower() == PIXEL_MAC:
+            matches.append(name[1])
+    matches = list(dict.fromkeys(matches))
     if len(matches) > 1:
         raise ValueError('Multiple interfaces match Pixel MAC; refusing to choose')
     return matches[0] if matches else None
 
 
 def read_interfaces():
-    return subprocess.check_output(['/sbin/ifconfig', '-a'], text=True)
+    return subprocess.check_output(['/usr/sbin/networksetup', '-listallhardwareports'], text=True)
 
 
 def main():
@@ -47,8 +55,12 @@ def main():
         # Recheck immediately before mutation. Never guess en5/en6 from ordering.
         if find_pixel(read_interfaces()) != interface:
             raise RuntimeError('Interface changed; refusing configuration')
-        subprocess.run(['sudo', '/sbin/ifconfig', interface, 'inet', '192.168.7.1',
-                        'netmask', '255.255.255.0', 'up'], check=True)
+        order = subprocess.check_output(['/usr/sbin/networksetup', '-listnetworkserviceorder'], text=True)
+        services = re.findall(r'^\(\d+\) (.+)\n\(Hardware Port: [^\n]+, Device: ' + re.escape(interface) + r'\)$', order, re.M)
+        if len(services) != 1:
+            raise RuntimeError('Cannot uniquely identify the Pixel network service')
+        subprocess.run(['/usr/sbin/networksetup', '-setmanual', services[0],
+                        '192.168.7.1', '255.255.255.0'], check=True)
         subprocess.run(['/sbin/ping', '-c', '3', '-W', '1000', '192.168.7.2'], check=False)
     if a.listen:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:

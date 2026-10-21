@@ -39,8 +39,8 @@ Hardware tests must confirm touch remains responsive during polling.
 ## Mac local-link helper
 
 `python3 tools/pixel-usb-macos.py` only reports whether the matching CDC-ECM
-interface exists. `--configure-link` rechecks its exact host MAC, then uses sudo
-to assign 192.168.7.1/24 to that interface and ping the phone. `--listen` receives
+interface exists. `--configure-link` rechecks its exact host MAC, then uses networksetup
+to assign 192.168.7.1/24 to that interface's unique network service and ping the phone. `--listen` receives
 UDP kernel logs after the local link is configured. This does not enable NAT,
 forwarding or DNS and does not modify unrelated network interfaces.
 Interface-selection tests pass; current Mac inspection found no Pixel ECM
@@ -87,3 +87,17 @@ valid USB input and fast charging. Cable transition and iOS reporting remain
 to verify. DWC3 GSNPSID is 0x33313130, VER_NUMBER 0x3138302a (DWC3.1).
 The original kernel guard incorrectly compared the ID to a version-format
 value; corrected to recognize the DWC3.1 ID family 0x3331xxxx, matching Linux.
+
+## First iOS USB test
+
+CI 39533700976 succeeded (kernel SHA256
+cd93feacaa32f774814984f62974ae3a9da8a55c4159f798c070916dbb22973d).
+Temporary eight-core boot of out/phone-ios-usb-battery-v2/boot.img succeeded.
+Mac recognized Sweet iOS USB Ethernet and AppleUserECM / AppleUserECMData
+matched; en5 appeared. Permanent MAC 02:00:5e:77:ee:01 was correct in
+networksetup; ifconfig temporarily showed 02:00:00:00:00:00, so the helper
+now identifies the interface by networksetup's permanent hardware address.
+The new Sweet iOS network service was changed from DHCP to manual
+192.168.7.1/24, no router. USB disconnected before packet tests completed.
+Ping did not succeed; no kernel logs were captured. Awaiting whether user
+unplugged or phone/driver disconnected. No NAT/forwarding/DNS changes made.

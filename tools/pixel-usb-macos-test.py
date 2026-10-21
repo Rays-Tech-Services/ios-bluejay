@@ -24,6 +24,10 @@ class InterfaceSelection(unittest.TestCase):
     def test_phone_mac_is_not_host_mac(self):
         self.assertIsNone(pixelusb.find_pixel(entry('en5', '02:00:5e:77:ee:02')))
 
+    def test_driverkit_permanent_mac(self):
+        text = 'Hardware Port: Sweet iOS (USB Ethernet)\nDevice: en5\nEthernet Address: 02:00:5e:77:ee:01\n'
+        self.assertEqual(pixelusb.find_pixel(text), 'en5')
+
     def test_ambiguous_interfaces_are_rejected(self):
         with self.assertRaises(ValueError):
             pixelusb.find_pixel(entry('en5', pixelusb.PIXEL_MAC) + entry('en6', pixelusb.PIXEL_MAC))
