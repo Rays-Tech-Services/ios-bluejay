@@ -46,3 +46,29 @@ Source reference (December 2022):
 https://github.com/WebKit/WebKit/blob/ac18fb1c144afb42706b9012347ce37fc47226da/Source/WebCore/platform/graphics/cocoa/IOSurface.mm
 The local binary, rather than this nearby source revision, determines the
 installed IOSurface user-client ABI.
+
+## Phone result and next diagnostic
+
+The user confirms that the BGRA test makes only the webpage area black;
+Safari controls and the rest of the phone still work. Local requests still
+return 200, and the kernel log verifies the requested WebKit formats were
+normalized. The experiment did not fix rendering. GPU process creation alone
+does not prove accelerated hardware drawing or that the preference toggles
+failed: other graphics work can still use that process.
+
+`sweetweb_trace=1` adds a read-only diagnostic, independent of BGRA policy.
+New surfaces created by the exact WebKit GPU/WebContent processes are tagged.
+Every two seconds the existing display timer samples at most 32 retained
+surfaces, outside display/surface locks, up to 30 polls per surface. Only
+single-plane BGRA/4-byte-element buffers with validated allocation bounds are
+sampled. The log contains counts of sampled nonzero pixels, RGB and alpha;
+it contains no raw pixel values or text. Sampling cannot prove an entire
+surface is blank. Concurrent painting means it is an approximate observation.
+
+Mapping/export/lock/unlock events are capped at 16 per surface. WebKit user
+client method signatures are capped at 64 per client; unlike the older global
+once-per-selector log, these show the WebKit calls even when SpringBoard
+already used the same selector. No missing method is newly advertised as
+implemented. The diagnostic is off by default and does not change page data,
+rendering formats, or synchronization. Host sanitizer checks cover transparent,
+opaque black, colored, padded/offset and short/out-of-bounds buffers.

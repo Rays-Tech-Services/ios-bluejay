@@ -1078,6 +1078,20 @@ index 9969739..eed20eb 100644
  			poll();
  			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
  		}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d8a7f5a..525742a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -235,6 +235,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if ((count % 120) == 0) {
++		sweet_surface_trace_poll();
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 0631685..8e92823 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
@@ -1089,19 +1103,92 @@ index 0631685..8e92823 100644
 +#include "SweetUSBNetwork.h"
  #endif /* SWEET */
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 7f90c56..9817cd1 100644
+index 7f90c56..5b2d5bf 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -39,6 +39,8 @@
+@@ -39,6 +39,9 @@
  #include <libkern/c++/OSNumber.h>
  #include <libkern/c++/OSUnserialize.h>
  #include <sys/proc.h>
 +#include <pexpert/pexpert.h>
 +#include "SweetSurfaceFormat.h"
++#include "SweetSurfaceProbe.h"
  
  enum {
  	kSweetSurfaceCreate             = 0,
-@@ -316,7 +318,8 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -73,6 +76,7 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++static int           sweet_surface_web_trace;
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+@@ -110,6 +114,54 @@ sweet_surface_seed(SweetSurface *s)
+ 	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
+ }
+ 
++/* Called with a retained surface. No raw pixels or text go into the log. */
++static void
++sweet_surface_trace_event(SweetSurface *s, const char *event)
++{
++	if (!s->webTrace || OSIncrementAtomic((volatile SInt32 *)&s->webTraceCalls) >= 16) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	IOLog("SWEET WEB: %s %s id %u seed %u fmt 0x%x\n", name, event,
++	    s->id, *sweet_surface_seed(s), s->pixelFormat);
++}
++
++void
++sweet_surface_trace_poll(void)
++{
++	if (!sweet_surface_web_trace || sweet_surface_lock == NULL) {
++		return;
++	}
++	/* Limit both retained objects and per-object samples. This runs outside
++	 * the framebuffer and surface locks, and never changes the pixels. */
++	SweetSurface *batch[32];
++	unsigned count = 0;
++	IOLockLock(sweet_surface_lock);
++	for (unsigned id = 1; id < SWEET_SURFACE_MAX_ID && count < 32; id++) {
++		SweetSurface *s = sweet_surface_table[id];
++		if (s != NULL && s->webTrace && s->webTracePolls < 30) {
++			s->webTracePolls++;
++			s->retain();
++			batch[count++] = s;
++		}
++	}
++	IOLockUnlock(sweet_surface_lock);
++	for (unsigned i = 0; i < count; i++) {
++		SweetSurface *s = batch[i];
++		SweetSurfaceProbe probe = {};
++		bool sampled = s->pixelFormat == SWEET_FORMAT_BGRA && s->planeCount == 0 &&
++		    s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1 &&
++		    s->memory != NULL && sweet_surface_probe_bgra(
++		    (const volatile unsigned char *)s->kernelAddress(), s->memory->getLength(),
++		    s->offset, s->width, s->height, s->bytesPerRow, &probe);
++		IOLog("SWEET WEB: poll id %u seed %u fmt 0x%x sampled %u n %u nonzero %u rgb %u alpha %u\n",
++		    s->id, *sweet_surface_seed(s), s->pixelFormat, (unsigned)sampled,
++		    probe.samples, probe.nonzero, probe.rgb, probe.alpha);
++		s->release();
++	}
++}
++
+ /*
+  * Give the surface an id and a table slot; the table holds one retain and a
+  * user count (creators, client mappings, kernel holders). Lock held.
+@@ -211,6 +263,8 @@ sweet_surface_alloc(void)
+ 		return NULL;
+ 	}
+ 	bzero(s->state->getBytesNoCopy(), page_size);
++	s->webTrace = false;
++	s->webTracePolls = s->webTraceCalls = 0;
+ 	return s;
+ }
+ 
+@@ -316,7 +370,8 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  			}
  			p->width = sweet_dict_u32(pd, "IOSurfacePlaneWidth", s->width);
  			p->height = sweet_dict_u32(pd, "IOSurfacePlaneHeight", s->height);
@@ -1111,7 +1198,44 @@ index 7f90c56..9817cd1 100644
  			p->elementWidth = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementWidth", 1);
  			p->elementHeight = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementHeight", 1);
  			if (p->width > SWEET_SURFACE_MAX_DIM || p->height > SWEET_SURFACE_MAX_DIM ||
-@@ -684,6 +687,33 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -393,6 +448,8 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++	PE_parse_boot_argn("sweetweb_trace", &sweet_surface_web_trace,
++	    sizeof(sweet_surface_web_trace));
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+@@ -405,6 +462,8 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	task_t   fTask;
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
++	bool fWebTrace;
++	uint32_t fTraceMethods;
+ 
+ 	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+@@ -450,6 +509,10 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt3
+ 		return false;
+ 	}
+ 	fTask = owningTask;
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	fWebTrace = sweet_surface_web_trace && sweet_surface_is_web_process(name);
++	fTraceMethods = 0;
+ 	fLock = IOLockAlloc();
+ 	fRefs = OSArray::withCapacity(16);
+ 	return fLock != NULL && fRefs != NULL;
+@@ -622,6 +685,7 @@ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+ IOReturn
+ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
+ {
++	sweet_surface_trace_event(s, "map");
+ 	SweetSurfaceRef *ref = NULL;
+ 	bool existing = false;
+ 	IOReturn ret = addRef(s, &ref, &existing);
+@@ -684,6 +748,34 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  	}
  	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
  	ret = sweet_surface_layout(s, props);
@@ -1123,6 +1247,7 @@ index 7f90c56..9817cd1 100644
 +	int webBGRA = 0;
 +	char creator[32];
 +	proc_selfname(creator, sizeof(creator));
++	s->webTrace = sweet_surface_web_trace && sweet_surface_is_web_process(creator);
 +	PE_parse_boot_argn("sweetweb_bgra", &webBGRA, sizeof(webBGRA));
 +	if (ret == kIOReturnSuccess &&
 +	    sweet_surface_web_bgra(webBGRA != 0, creator, s->pixelFormat, s->parentID)) {
@@ -1145,6 +1270,65 @@ index 7f90c56..9817cd1 100644
  	if (ret == kIOReturnSuccess) {
  		IOBufferMemoryDescriptor *mem = NULL;
  		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+@@ -727,6 +819,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+     __unused void *reference)
+ {
+ 	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++	if (fWebTrace && OSIncrementAtomic((volatile SInt32 *)&fTraceMethods) < 64) {
++		IOLog("SWEET WEB: method %u in %u/%u out %u/%u\n", selector,
++		    args->scalarInputCount, args->structureInputSize,
++		    args->scalarOutputCount, args->structureOutputSize);
++	}
+ 
+ 	switch (selector) {
+ 	case kSweetSurfaceLimits: {
+@@ -767,6 +864,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 			return kIOReturnNotFound;
+ 		}
+ 		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
++		sweet_surface_trace_event(s, "export");
+ 		args->scalarOutputCount = 1;
+ 		s->release();
+ 		sweet_surf_log_once("sel", selector);
+@@ -830,6 +928,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 		return kIOReturnNotFound;
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
++	sweet_surface_trace_event(s, "lock");
+ 	s->release();
+ 	return ret;
+ }
+@@ -844,6 +943,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
++	sweet_surface_trace_event(s, "unlock");
+ 	s->release();
+ 	return ret;
+ }
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index fbcdfac..97ec496 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -33,6 +33,8 @@ public:
+ 	uint16_t bytesPerElement;
+ 	uint8_t  elementWidth, elementHeight;
+ 	uint32_t cacheMode, planeCount, parentID;
++	bool webTrace;
++	uint32_t webTracePolls, webTraceCalls;
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
+@@ -50,6 +52,9 @@ public:
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
+ 
++/* Opt-in diagnostic, called every two seconds by the display timer. */
++void sweet_surface_trace_poll(void);
++
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index 44f005f..87e9a13 100644
 --- a/makedefs/MakeInc.def
@@ -1592,10 +1776,10 @@ index 0000000..c9e70f6
 +#endif
 diff --git a/iokit/Kernel/arm/SweetSurfaceFormat.h b/iokit/Kernel/arm/SweetSurfaceFormat.h
 new file mode 100644
-index 0000000..34c01ed
+index 0000000..5fc255d
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetSurfaceFormat.h
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,54 @@
 +/* Geometry policy shared by the kernel and the host-side checks. */
 +#ifndef SWEET_SURFACE_FORMAT_H
 +#define SWEET_SURFACE_FORMAT_H
@@ -1612,13 +1796,19 @@ index 0000000..34c01ed
 +}
 +
 +static inline bool
++sweet_surface_is_web_process(const char *process)
++{
++	return !__builtin_strcmp(process, "com.apple.WebKit.WebContent") ||
++	       !__builtin_strcmp(process, "com.apple.WebKit.GPU");
++}
++
++static inline bool
 +sweet_surface_web_bgra(bool enabled, const char *process, unsigned format,
 +    unsigned parent)
 +{
 +	return enabled && parent == 0 &&
 +	       (format == SWEET_FORMAT_RGB10 || format == SWEET_FORMAT_RGB10A8) &&
-+	       (!__builtin_strcmp(process, "com.apple.WebKit.WebContent") ||
-+	        !__builtin_strcmp(process, "com.apple.WebKit.GPU"));
++	       sweet_surface_is_web_process(process);
 +}
 +
 +struct SweetSurfaceBGRALayout {
@@ -1641,6 +1831,58 @@ index 0000000..34c01ed
 +	}
 +	result->rowBytes = row;
 +	result->allocSize = (unsigned)size;
++	return true;
++}
++#endif
+diff --git a/iokit/Kernel/arm/SweetSurfaceProbe.h b/iokit/Kernel/arm/SweetSurfaceProbe.h
+new file mode 100644
+index 0000000..edaa58b
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetSurfaceProbe.h
+@@ -0,0 +1,46 @@
++/* Bounded, read-only BGRA sampling for the temporary graphics diagnostic.
++ * Counts describe sampled pixels, not a proof that the whole image is blank.
++ * No pixel values or page text are emitted. Integer types come from caller. */
++#ifndef SWEET_SURFACE_PROBE_H
++#define SWEET_SURFACE_PROBE_H
++struct SweetSurfaceProbe {
++	unsigned samples, nonzero, rgb, alpha;
++};
++
++static inline void
++sweet_surface_probe_pixel(const volatile unsigned char *p, SweetSurfaceProbe *r)
++{
++	unsigned rgb = p[0] | p[1] | p[2], alpha = p[3];
++	r->samples++;
++	r->nonzero += (rgb | alpha) != 0;
++	r->rgb += rgb != 0;
++	r->alpha += alpha != 0;
++}
++
++static inline bool
++sweet_surface_probe_bgra(const volatile unsigned char *base, unsigned long long length,
++    unsigned offset, unsigned width, unsigned height, unsigned stride, SweetSurfaceProbe *r)
++{
++	*r = {};
++	if (!base || !width || !height || width > 16384 || height > 16384 ||
++	    stride < width * 4u ||
++	    (unsigned long long)offset + (unsigned long long)(height - 1) * stride +
++	    (unsigned long long)width * 4 > length) {
++		return false;
++	}
++	/* A whole-image grid, plus a denser top strip for plain-text test pages. */
++	for (unsigned gy = 0; gy < 64; gy++) {
++		unsigned y = (height - 1) * gy / 63;
++		for (unsigned gx = 0; gx < 64; gx++) {
++			unsigned x = (width - 1) * gx / 63;
++			sweet_surface_probe_pixel(base + offset + (unsigned long long)y * stride + x * 4, r);
++		}
++	}
++	for (unsigned y = 0; y < height && y < 192; y += 4) {
++		for (unsigned x = 0; x < width; x += 8) {
++			sweet_surface_probe_pixel(base + offset + (unsigned long long)y * stride + x * 4, r);
++		}
++	}
 +	return true;
 +}
 +#endif

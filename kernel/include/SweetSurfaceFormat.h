@@ -14,13 +14,19 @@ sweet_surface_plane_default_bpe(unsigned format, unsigned plane)
 }
 
 static inline bool
+sweet_surface_is_web_process(const char *process)
+{
+	return !__builtin_strcmp(process, "com.apple.WebKit.WebContent") ||
+	       !__builtin_strcmp(process, "com.apple.WebKit.GPU");
+}
+
+static inline bool
 sweet_surface_web_bgra(bool enabled, const char *process, unsigned format,
     unsigned parent)
 {
 	return enabled && parent == 0 &&
 	       (format == SWEET_FORMAT_RGB10 || format == SWEET_FORMAT_RGB10A8) &&
-	       (!__builtin_strcmp(process, "com.apple.WebKit.WebContent") ||
-	        !__builtin_strcmp(process, "com.apple.WebKit.GPU"));
+	       sweet_surface_is_web_process(process);
 }
 
 struct SweetSurfaceBGRALayout {
