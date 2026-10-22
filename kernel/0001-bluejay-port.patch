@@ -133,10 +133,10 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..6b5812f
+index 0000000..e1ccf8c
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
-@@ -0,0 +1,437 @@
+@@ -0,0 +1,447 @@
 +/*
 + * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
 + * sweetgpu=N, run once after the root mounts, everything logged:
@@ -152,6 +152,7 @@ index 0000000..6b5812f
 + * 0x17461e00), the Pixel 6 panfrost patches (GPU at 0x1c500000, ID 0x9202,
 + * rails and G3D clock left on by the bootloader), Linux panfrost_regs.h /
 + * panfrost_gpu.c / panfrost_mmu.c / panfrost_job.c and Mesa genxml v9.xml.
++ *   4  + enable SweetGPU for the injected Panfrost renderer after job success.
 + * Interrupts stay masked: everything is polled.
 + * sweetgpu_delay=0..300 delays the probe in seconds so USB logging can
 + * become reachable before the one-shot diagnostic runs (default: no delay).
@@ -401,6 +402,8 @@ index 0000000..6b5812f
 +	return gpu_poll(AS_REG(0, AS_STATUS), AS_STATUS_AS_ACTIVE, 0, 10);
 +}
 +
++static bool bg_job_success;
++
 +static void
 +bg_job_test(void)
 +{
@@ -473,6 +476,8 @@ index 0000000..6b5812f
 +	bool done = (raw & (1u << 1)) != 0;
 +	flush_dcache64((addr64_t)pa, BG_SIZE, TRUE);
 +	uint32_t got = *(volatile uint32_t *)(mem + BG_TARGET);
++	bg_job_success = done && !(raw & (1u << 17)) && got == BG_MAGIC &&
++	    !gpu_rd(MMU_INT_RAWSTAT);
 +	printf("BLUEJAY GPU: job %s: JOB_INT_RAWSTAT 0x%x JS1_STATUS 0x%x head 0x%x, exception 0x%x, target 0x%08x (%s)\n",
 +	    done ? "done" : ((raw & (1u << 17)) ? "FAILED" : "TIMEOUT"), raw,
 +	    gpu_rd(JS_REG(1, JS_STATUS)), gpu_rd(JS_REG(1, JS_HEAD_LO)), job[0], got,
@@ -482,6 +487,8 @@ index 0000000..6b5812f
 +	    gpu_rd(AS_REG(0, AS_FAULTADDRESS_HI)), gpu_rd(AS_REG(0, AS_FAULTADDRESS_LO)),
 +	    gpu_rd(GPU_FAULT_STATUS), gpu_rd(GPU_FAULT_ADDRESS_LO));
 +}
++
++#include "bluejay_gpu_backend.inc"
 +
 +static void
 +bluejay_gpu_thread(void *arg, __unused wait_result_t wr)
@@ -541,6 +548,9 @@ index 0000000..6b5812f
 +		return;
 +	}
 +	bg_job_test();
++	if (level >= 4 && bg_job_success) {
++		(void)bv_init();
++	}
 +}
 +
 +void bluejay_gpu_start(void);
@@ -573,6 +583,278 @@ index 0000000..6b5812f
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(th);
 +	}
++}
+diff --git a/bsd/dev/bluejay_gpu_backend.inc b/bsd/dev/bluejay_gpu_backend.inc
+new file mode 100644
+index 0000000..3b25ec2
+--- /dev/null
++++ b/bsd/dev/bluejay_gpu_backend.inc
+@@ -0,0 +1,266 @@
++/* Synchronous Mali address-space backend. Only enabled by sweetgpu=4,
++ * after the physical WRITE_VALUE self-test succeeds. The IOKit service
++ * serializes mappings, jobs and faults. Tables remain wired for boot life.
++ */
++#include "../../iokit/Kernel/arm/BluejayGPU.h"
++#define BV_BASE (1ULL << 30)
++#define BV_PAGES ((1u << 30) / PAGE_SIZE)
++#define BV_CHUNKS 512u
++static bool bv_online;
++static bool bv_dma_stopped = true;
++static uint64_t *bv_l0, *bv_l1, *bv_l2, *bv_l3[BV_CHUNKS];
++static uint8_t bv_used[BV_PAGES];
++static vm_offset_t bv_pool;
++static unsigned bv_pool_next = 4;
++static uint64_t bv_root_pa;
++
++static uint64_t *
++bv_table(uint64_t *pa)
++{
++	if (bv_pool_next == 4) {
++		if (kmem_alloc_contig(kernel_map, &bv_pool, PAGE_SIZE, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			return NULL;
++		}
++		bv_pool_next = 0;
++	}
++	vm_offset_t va = bv_pool + bv_pool_next++ * 4096;
++	*pa = ptoa_64(pmap_find_phys(kernel_pmap, va)) + (va & PAGE_MASK);
++	return (uint64_t *)va;
++}
++
++/* Locked whole-window invalidation, following panfrost_mmu.c AS_LOCKADDR.
++ * Lock region is 1GB, so its encoded log2(size)-1 is 29.
++ */
++static bool
++bv_flush(void)
++{
++	gpu_wr(AS_REG(0, 0x10), (uint32_t)BV_BASE | 29u);
++	gpu_wr(AS_REG(0, 0x14), 0);
++	return bg_as_cmd(2) && bg_as_cmd(AS_COMMAND_FLUSH_MEM);
++}
++
++static bool
++bv_activate(void)
++{
++	uint32_t bits = gpu_rd(GPU_MMU_FEATURES) & 0xff;
++	if (bits < 33 || bits > 48) {
++		return false;
++	}
++	uint64_t cfg = AS_TRANSCFG_ADRMODE_AARCH64_4K | AS_TRANSCFG_INA_BITS(55 - bits) |
++	    AS_TRANSCFG_PTW_MEMATTR_NC | AS_TRANSCFG_PTW_RA;
++	gpu_wr(AS_REG(0, AS_TRANSTAB_LO), (uint32_t)bv_root_pa);
++	gpu_wr(AS_REG(0, AS_TRANSTAB_HI), (uint32_t)(bv_root_pa >> 32));
++	gpu_wr(AS_REG(0, AS_MEMATTR_LO), (uint32_t)MEMATTR_NC_ALL);
++	gpu_wr(AS_REG(0, AS_MEMATTR_HI), (uint32_t)(MEMATTR_NC_ALL >> 32));
++	gpu_wr(AS_REG(0, AS_TRANSCFG_LO), (uint32_t)cfg);
++	gpu_wr(AS_REG(0, AS_TRANSCFG_HI), (uint32_t)(cfg >> 32));
++	return bg_as_cmd(AS_COMMAND_UPDATE);
++}
++
++static bool
++bv_init(void)
++{
++	uint64_t p0, p1, p2;
++	bv_l0 = bv_table(&p0);
++	bv_l1 = bv_table(&p1);
++	bv_l2 = bv_table(&p2);
++	if (!bv_l0 || !bv_l1 || !bv_l2) {
++		return false;
++	}
++	bv_l0[0] = p1 | PTE_TABLE;
++	bv_l1[1] = p2 | PTE_TABLE;
++	flush_dcache64((addr64_t)bv_l0, 4096, FALSE);
++	flush_dcache64((addr64_t)bv_l1, 4096, FALSE);
++	flush_dcache64((addr64_t)bv_l2, 4096, FALSE);
++	bv_root_pa = (gpu_rd(GPU_MMU_FEATURES) & 0xff) > 39 ? p0 : p1;
++	__atomic_store_n(&bv_online, bv_activate(), __ATOMIC_RELEASE);
++	printf("BLUEJAY GPU: user address space %s\n", bv_online ? "ready" : "failed");
++	return bv_online;
++}
++
++bool bluejay_gpu_ready(void) { return __atomic_load_n(&bv_online, __ATOMIC_ACQUIRE); }
++uint32_t bluejay_gpu_id(void) { return bv_online ? gpu_rd(GPU_ID) : 0; }
++
++bool
++bluejay_gpu_param(uint32_t param, uint64_t *value)
++{
++	if (!bv_online || !value) {
++		return false;
++	}
++	static const uint16_t offsets[] = {
++		0, 0, 0x100, 0x110, 0x120, 0xe00, 0x18, 0x1c,
++		0x4, 0x8, 0xc, 0x10, 0x14, 0xac, 0xa0, 0xa4,
++		0xa8, 0x300, 0xb0, 0xb4, 0xb8, 0xbc,
++	};
++	if (param == 0 || param == 1) {
++		*value = param ? gpu_rd(GPU_ID) & 0xffff : gpu_rd(GPU_ID) >> 16;
++	} else if (param < sizeof(offsets) / sizeof(offsets[0])) {
++		*value = gpu_rd(offsets[param]);
++		if (param >= 2 && param <= 5) {
++			*value |= (uint64_t)gpu_rd(offsets[param] + 4) << 32;
++		}
++	} else if (param < 38) {
++		*value = gpu_rd(0xc0 + (param - 22) * 4);
++	} else if (param == 38) { /* NR_CORE_GROUPS */
++		*value = 1;
++	} else if (param == 39) { /* THREAD_TLS_ALLOC */
++		*value = gpu_rd(0x310);
++	} else if (param == 40) { /* AFBC_FEATURES */
++		*value = gpu_rd(0x4c);
++	} else if (param == 41) { /* SYSTEM_TIMESTAMP: CNTVCT at the platform rate */
++		__asm__ volatile ("mrs %0, cntvct_el0" : "=r" (*value));
++	} else if (param == 42) {
++		__asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (*value));
++	} else if (param == 43) { /* no JM contexts, priority query unsupported */
++		return false;
++	} else if (param == 44) {
++		*value = COHERENCY_NONE;
++	} else {
++		return false;
++	}
++	return true;
++}
++
++uint64_t
++bluejay_gpu_map(const uint64_t *pages, uint32_t count, bool readonly, bool noexec)
++{
++	if (!bv_online || !pages || !count || count >= BV_PAGES) {
++		return 0;
++	}
++	uint32_t run = 0, first = 0;
++	for (uint32_t i = 0; i < BV_PAGES; i++) {
++		run = bv_used[i] ? 0 : run + 1;
++		if (run == count + 1) {
++			first = i + 1 - run;
++			break;
++		}
++	}
++	if (run != count + 1) {
++		return 0;
++	}
++	for (uint32_t p = 0; p < count; p++) {
++		if (!pages[p] || (pages[p] & PAGE_MASK) || (pages[p] >> 40)) {
++			return 0;
++		}
++	}
++	uint32_t c0 = first * PAGE_SIZE / (2u << 20);
++	uint32_t c1 = (first + count - 1) * PAGE_SIZE / (2u << 20);
++	for (uint32_t c = c0; c <= c1; c++) {
++		if (!bv_l3[c]) {
++			uint64_t pa;
++			bv_l3[c] = bv_table(&pa);
++			if (!bv_l3[c]) {
++				return 0;
++			}
++			bv_l2[c] = pa | PTE_TABLE;
++		}
++	}
++	uint64_t attrs = PTE_PAGE | PTE_AF | PTE_SH_OS | PTE_AP_UNPRIV |
++	    (readonly ? 1ULL << 7 : 0) | (noexec ? 3ULL << 53 : 0);
++	for (uint32_t p = 0; p < count; p++) {
++		for (unsigned s = 0; s < PAGE_SIZE / 4096; s++) {
++			uint32_t index = (first + p) * (PAGE_SIZE / 4096) + s;
++			bv_l3[index / 512][index % 512] = (pages[p] + s * 4096) | attrs;
++		}
++	}
++	for (uint32_t c = c0; c <= c1; c++) {
++		flush_dcache64((addr64_t)bv_l3[c], 4096, FALSE);
++	}
++	flush_dcache64((addr64_t)bv_l2, 4096, FALSE);
++	/* If invalidation fails, quarantine this address space and retain pages
++	 * through client teardown until a reset has stopped the hardware. */
++	for (uint32_t p = first; p <= first + count; p++) {
++		bv_used[p] = 1;
++	}
++	if (!bv_flush()) {
++		gpu_wr(GPU_CMD, GPU_CMD_HARD_RESET);
++		bv_online = false;
++		return 0;
++	}
++	return BV_BASE + (uint64_t)first * PAGE_SIZE;
++}
++
++bool
++bluejay_gpu_unmap(uint64_t va, uint32_t count)
++{
++	if (va < BV_BASE || va >= BV_BASE + (1ULL << 30) || (va & PAGE_MASK) ||
++	    !count || count >= BV_PAGES) {
++		return false;
++	}
++	uint32_t first = (uint32_t)((va - BV_BASE) / PAGE_SIZE);
++	if (first > BV_PAGES - count - 1) {
++		return false;
++	}
++	for (uint32_t p = first; p < first + count; p++) {
++		for (unsigned s = 0; s < PAGE_SIZE / 4096; s++) {
++			uint32_t i = p * (PAGE_SIZE / 4096) + s;
++			if (bv_l3[i / 512]) {
++				bv_l3[i / 512][i % 512] = 0;
++			}
++		}
++	}
++	for (uint32_t c = first * PAGE_SIZE / (2u << 20);
++	    c <= (first + count - 1) * PAGE_SIZE / (2u << 20); c++) {
++		if (bv_l3[c]) {
++			flush_dcache64((addr64_t)bv_l3[c], 4096, FALSE);
++		}
++	}
++	if (!bv_online && !bv_dma_stopped) {
++		return false;
++	}
++	if (bv_online && !bv_flush()) {
++		/* Never release backing while the GPU could still use stale PTEs. */
++		bv_online = false;
++		gpu_wr(GPU_CMD, GPU_CMD_HARD_RESET);
++		return false;
++	}
++	for (uint32_t p = first; p <= first + count; p++) {
++		bv_used[p] = 0;
++	}
++	return true;
++}
++
++bool
++bluejay_gpu_submit(uint64_t job, bool fragment)
++{
++	if (!bv_online || !job || (job & 63)) {
++		return false;
++	}
++	unsigned slot = fragment ? 0 : 1;
++	uint32_t done = 1u << slot, failed = 1u << (slot + 16);
++	gpu_wr(JOB_INT_CLEAR, 0xffffffffu);
++	gpu_wr(JS_REG(slot, JS_HEAD_NEXT_LO), (uint32_t)job);
++	gpu_wr(JS_REG(slot, JS_HEAD_NEXT_HI), (uint32_t)(job >> 32));
++	gpu_wr(JS_REG(slot, JS_AFFINITY_NEXT_LO), gpu_rd(GPU_SHADER_PRESENT_LO));
++	gpu_wr(JS_REG(slot, JS_AFFINITY_NEXT_HI), gpu_rd(GPU_SHADER_PRESENT_HI));
++	gpu_wr(JS_REG(slot, JS_CONFIG_NEXT), JS_CONFIG_THREAD_PRI(8) |
++	    JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE | JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE);
++	bv_dma_stopped = false;
++	gpu_wr(JS_REG(slot, JS_COMMAND_NEXT), JS_COMMAND_START);
++	for (unsigned i = 0; i < 2000; i++) {
++		uint32_t raw = gpu_rd(JOB_INT_RAWSTAT);
++		if (raw & (done | failed)) {
++			if ((raw & done) && !(raw & failed) && !gpu_rd(MMU_INT_RAWSTAT)) {
++				bv_dma_stopped = true;
++				gpu_wr(JOB_INT_CLEAR, done);
++				return true;
++			}
++			break;
++		}
++		if (gpu_rd(MMU_INT_RAWSTAT) || gpu_rd(GPU_FAULT_STATUS)) {
++			break;
++		}
++		delay(1000);
++	}
++	printf("BLUEJAY GPU: submit fault slot %u raw 0x%x status 0x%x MMU 0x%x AS 0x%x addr %08x%08x\n",
++	    slot, gpu_rd(JOB_INT_RAWSTAT), gpu_rd(JS_REG(slot, JS_STATUS)),
++	    gpu_rd(MMU_INT_RAWSTAT), gpu_rd(AS_REG(0, AS_FAULTSTATUS)),
++	    gpu_rd(AS_REG(0, AS_FAULTADDRESS_HI)), gpu_rd(AS_REG(0, AS_FAULTADDRESS_LO)));
++	/* Reset stops all DMA. Disable further work instead of repeated hangs. */
++	bv_online = false;
++	gpu_wr(GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
++	gpu_wr(GPU_CMD, GPU_CMD_HARD_RESET);
++	bv_dma_stopped = gpu_poll(GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 100);
++	return false;
 +}
 diff --git a/bsd/dev/bluejay_touch.c b/bsd/dev/bluejay_touch.c
 new file mode 100644
@@ -1609,6 +1891,30 @@ index d74c063..75f6eca 100644
  		/* Add a busy count to keep the registry busy until the IOKit daemon has
  		 * completely finished launching. This is decremented when the IOKit daemon
  		 * messages the kernel after the in-kernel linker has been
+diff --git a/iokit/Kernel/arm/BluejayGPU.h b/iokit/Kernel/arm/BluejayGPU.h
+new file mode 100644
+index 0000000..ed0aafe
+--- /dev/null
++++ b/iokit/Kernel/arm/BluejayGPU.h
+@@ -0,0 +1,18 @@
++#ifndef BLUEJAY_GPU_H
++#define BLUEJAY_GPU_H
++#include <stdint.h>
++#include <stdbool.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Caller serializes all calls with the SweetGPU service lock. */
++bool bluejay_gpu_ready(void);
++uint32_t bluejay_gpu_id(void);
++bool bluejay_gpu_param(uint32_t param, uint64_t *value);
++uint64_t bluejay_gpu_map(const uint64_t *pages, uint32_t count, bool readonly, bool noexec);
++bool bluejay_gpu_unmap(uint64_t va, uint32_t count);
++bool bluejay_gpu_submit(uint64_t job, bool fragment);
++#ifdef __cplusplus
++}
++#endif
++#endif
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index 9969739..5c05358 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
@@ -2371,6 +2677,427 @@ index d8a7f5a..537f75b 100644
  /* A40 scaled mode: layer rect in logical coordinates -> nearest-neighbour fill of the panel. */
  void
  AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+new file mode 100644
+index 0000000..7d0dca9
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -0,0 +1,373 @@
++/* Pixel Mali-G78 IOKit bridge. ABI and synchronous buffer/submit design follow
++ * joranv1's ios-sailfish SweetGPU, reused with permission; Mali backend is new.
++ * Experimental opt-in sweetgpu=4; root clients only. No service on QEMU.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++#include <device/device_types.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <arm/caches_internal.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "SweetSurface.h"
++#include "SweetGPUABI.h"
++#include "BluejayGPU.h"
++
++struct SweetBO {
++	IOMemoryDescriptor *memory;
++	IOMemoryMap *mapping;
++	SweetSurface *surface;
++	uint64_t *pages;
++	uint64_t va, size;
++	uint32_t flags, count;
++	bool prepared;
++};
++static IOLock *gpu_lock;
++static uint64_t gpu_wired;
++static unsigned gpu_submits;
++
++class SweetGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetGPUUserClient);
++	task_t fTask;
++	SweetBO *fBO;
++	bool fClosed;
++	IOReturn makeBO(uint64_t size, uint32_t flags, SweetSurface *surface, uint64_t *out);
++	IOReturn dropBO(uint32_t handle);
++	void cleanup();
++	IOReturn run(const sweet_gpu_submit *request, size_t size);
++public:
++	bool initWithTask(task_t task, void *security, UInt32 type, OSDictionary *props) APPLE_KEXT_OVERRIDE;
++	IOReturn clientClose() APPLE_KEXT_OVERRIDE;
++	void free() APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch = NULL, OSObject *target = NULL,
++	    void *reference = NULL) APPLE_KEXT_OVERRIDE;
++};
++class SweetGPU : public IOService {
++	OSDeclareDefaultStructors(SweetGPU);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t task, void *security, UInt32 type,
++	    OSDictionary *props, IOUserClient **client) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(SweetGPU, IOService);
++OSDefineMetaClassAndStructors(SweetGPUUserClient, IOUserClient);
++
++bool
++SweetGPU::start(IOService *provider)
++{
++	int mode = 0;
++	DTEntry entry;
++	const uint32_t *qemu;
++	unsigned length = 0;
++	PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
++	if (mode != 4 || SecureDTLookupEntry(NULL, "/bluejay", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, "qemu", (const void **)&qemu, &length) != kSuccess ||
++	    length != 4 || *qemu != 0 || !IOService::start(provider)) {
++		return false;
++	}
++	gpu_lock = IOLockAlloc();
++	if (!gpu_lock) {
++		return false;
++	}
++	setName("SweetGPU");
++	setProperty("ExperimentalPanfrost", true);
++	registerService();
++	IOLog("BLUEJAY GPU: SweetGPU registered; waiting for hardware self-test\n");
++	return true;
++}
++
++IOReturn
++SweetGPU::newUserClient(task_t task, void *security, UInt32 type,
++    OSDictionary *props, IOUserClient **client)
++{
++	if (!client || type || IOUserClient::clientHasPrivilege(security, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
++		return kIOReturnNotPrivileged;
++	}
++	*client = NULL;
++	for (unsigned i = 0; i < 500 && !bluejay_gpu_ready(); i++) {
++		IOSleep(10);
++	}
++	if (!bluejay_gpu_ready()) {
++		return kIOReturnNotReady;
++	}
++	SweetGPUUserClient *uc = new SweetGPUUserClient;
++	if (!uc) {
++		return kIOReturnNoMemory;
++	}
++	if (!uc->initWithTask(task, security, type, props) || !uc->attach(this) || !uc->start(this)) {
++		if (uc->getProvider()) {
++			uc->detach(this);
++		}
++		uc->release();
++		return kIOReturnError;
++	}
++	*client = uc;
++	return kIOReturnSuccess;
++}
++
++bool
++SweetGPUUserClient::initWithTask(task_t task, void *security, UInt32 type, OSDictionary *props)
++{
++	fBO = NULL;
++	fClosed = true;
++	if (!IOUserClient::initWithTask(task, security, type, props)) {
++		return false;
++	}
++	fTask = task;
++	fBO = (SweetBO *)IOMallocZero(sizeof(*fBO) * SWEET_GPU_MAX_HANDLES);
++	fClosed = false;
++	return fBO != NULL;
++}
++
++static void
++syncBO(SweetBO *bo)
++{
++	for (uint32_t p = 0; p < bo->count; p++) {
++		flush_dcache64((addr64_t)bo->pages[p], PAGE_SIZE, TRUE);
++	}
++}
++
++IOReturn
++SweetGPUUserClient::makeBO(uint64_t size, uint32_t flags, SweetSurface *surface, uint64_t *out)
++{
++	if (!size || size > SWEET_GPU_MAX_BO_BYTES ||
++	    flags & ~(SWEET_GPU_BO_NOEXEC | SWEET_GPU_BO_HEAP)) {
++		return kIOReturnBadArgument;
++	}
++	size = round_page_64(size);
++	if (size > SWEET_GPU_MAX_WIRED_BYTES - gpu_wired) {
++		return kIOReturnNoResources;
++	}
++	uint32_t h;
++	for (h = 1; h < SWEET_GPU_MAX_HANDLES && fBO[h].memory; h++) {}
++	if (h == SWEET_GPU_MAX_HANDLES) {
++		return kIOReturnNoResources;
++	}
++	SweetBO b = {};
++	b.size = size;
++	b.flags = flags;
++	b.count = (uint32_t)(size / PAGE_SIZE);
++	b.pages = (uint64_t *)IOMallocZero(sizeof(*b.pages) * b.count);
++	if (!b.pages) {
++		return kIOReturnNoMemory;
++	}
++	IOReturn ret = kIOReturnNoMemory;
++	if (surface) {
++		if (!surface->memory || surface->memory->getLength() != size) {
++			ret = kIOReturnBadArgument;
++			goto fail;
++		}
++		b.surface = surface;
++		surface->retain();
++		b.memory = surface->memory;
++		b.memory->retain();
++	} else {
++		b.memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMapInhibitCache,
++		    size, PAGE_SIZE);
++		if (!b.memory) {
++			goto fail;
++		}
++		bzero(((IOBufferMemoryDescriptor *)b.memory)->getBytesNoCopy(), size);
++	}
++	ret = b.memory->prepare();
++	if (ret != kIOReturnSuccess) {
++		goto fail;
++	}
++	b.prepared = true;
++	for (uint32_t p = 0; p < b.count; p++) {
++		IOByteCount length = 0;
++		b.pages[p] = b.memory->getPhysicalSegment((IOByteCount)p * PAGE_SIZE, &length);
++		if (!b.pages[p] || (b.pages[p] & PAGE_MASK) || length < PAGE_SIZE) {
++			ret = kIOReturnVMError;
++			goto fail;
++		}
++	}
++	if (!surface) {
++		b.mapping = b.memory->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapInhibitCache);
++		if (!b.mapping) {
++			ret = kIOReturnVMError;
++			goto fail;
++		}
++	}
++	syncBO(&b);
++	b.va = bluejay_gpu_map(b.pages, b.count, surface && surface->readOnly,
++	    (flags & SWEET_GPU_BO_NOEXEC) != 0);
++	if (!b.va) {
++		ret = kIOReturnNoResources;
++		goto fail;
++	}
++	gpu_wired += size;
++	fBO[h] = b;
++	out[0] = h;
++	out[1] = b.va;
++	out[2] = surface ? size : b.mapping->getVirtualAddress();
++	if (!surface) {
++		out[3] = size;
++	}
++	return kIOReturnSuccess;
++fail:
++	OSSafeReleaseNULL(b.mapping);
++	if (b.prepared) {
++		b.memory->complete();
++	}
++	OSSafeReleaseNULL(b.memory);
++	OSSafeReleaseNULL(b.surface);
++	IOFree(b.pages, sizeof(*b.pages) * b.count);
++	return ret;
++}
++
++IOReturn
++SweetGPUUserClient::dropBO(uint32_t h)
++{
++	if (!h || h >= SWEET_GPU_MAX_HANDLES || !fBO[h].memory) {
++		return kIOReturnBadArgument;
++	}
++	SweetBO *b = &fBO[h];
++	if (!bluejay_gpu_unmap(b->va, b->count)) {
++		/* Keep wired descriptors on an unconfirmed reset/TLB failure. */
++		return kIOReturnIOError;
++	}
++	OSSafeReleaseNULL(b->mapping);
++	if (b->prepared) {
++		b->memory->complete();
++	}
++	OSSafeReleaseNULL(b->memory);
++	OSSafeReleaseNULL(b->surface);
++	IOFree(b->pages, sizeof(*b->pages) * b->count);
++	gpu_wired -= b->size;
++	bzero(b, sizeof(*b));
++	return kIOReturnSuccess;
++}
++
++IOReturn
++SweetGPUUserClient::run(const sweet_gpu_submit *request, size_t size)
++{
++	if (size < sizeof(*request) || !request->handle_count ||
++	    request->handle_count > SWEET_GPU_MAX_SUBMIT_BOS || request->requirements & ~1u ||
++	    size != sizeof(*request) + request->handle_count * sizeof(uint32_t) ||
++	    !request->job || (request->job & 63)) {
++		return kIOReturnBadArgument;
++	}
++	const uint32_t *handles = (const uint32_t *)(request + 1);
++	bool jobFound = false;
++	for (uint32_t i = 0; i < request->handle_count; i++) {
++		uint32_t h = handles[i];
++		if (!h || h >= SWEET_GPU_MAX_HANDLES || !fBO[h].memory) {
++			return kIOReturnBadArgument;
++		}
++		SweetBO *b = &fBO[h];
++		if (request->job >= b->va && request->job - b->va <= b->size - 64) {
++			jobFound = true;
++		}
++	}
++	if (!jobFound) {
++		return kIOReturnBadArgument;
++	}
++	/* A single address space is deliberately restricted to trusted root clients.
++	 * GPU PTEs preserve read-only client mappings; NOEXEC forbids code fetch.
++	 */
++	for (uint32_t i = 0; i < request->handle_count; i++) {
++		syncBO(&fBO[handles[i]]);
++	}
++	bool ok = bluejay_gpu_submit(request->job, request->requirements & 1);
++	if (ok) {
++		for (uint32_t i = 0; i < request->handle_count; i++) {
++			syncBO(&fBO[handles[i]]);
++		}
++		if (gpu_submits++ < 16) {
++			IOLog("BLUEJAY GPU: userspace submit %u completed slot %u\n",
++			    gpu_submits, request->requirements & 1 ? 0 : 1);
++		}
++	}
++	return ok ? kIOReturnSuccess : kIOReturnIOError;
++}
++
++IOReturn
++SweetGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
++    IOExternalMethodDispatch *, OSObject *, void *)
++{
++	if (!a || !fBO) {
++		return kIOReturnBadArgument;
++	}
++	IOLockLock(gpu_lock);
++	IOReturn ret = kIOReturnBadArgument;
++	if (fClosed || !bluejay_gpu_ready()) {
++		IOLockUnlock(gpu_lock);
++		return kIOReturnNotReady;
++	}
++	uint64_t h = a->scalarInputCount ? a->scalarInput[0] : 0;
++	if (selector == SWEET_GPU_SUBMIT) {
++		if (!a->scalarInputCount && !a->scalarOutputCount && !a->structureOutputSize && a->structureInput) {
++			ret = run((const sweet_gpu_submit *)a->structureInput, a->structureInputSize);
++		}
++	} else if (a->structureInputSize || a->structureOutputSize) {
++		ret = kIOReturnBadArgument;
++	} else if (selector == SWEET_GPU_INFO && !a->scalarInputCount && a->scalarOutputCount == 3) {
++		a->scalarOutput[0] = SWEET_GPU_ABI_MAGIC;
++		a->scalarOutput[1] = SWEET_GPU_ABI_VERSION;
++		a->scalarOutput[2] = bluejay_gpu_id();
++		ret = kIOReturnSuccess;
++	} else if (selector == SWEET_GPU_GET_PARAM && a->scalarInputCount == 1 && a->scalarOutputCount == 1 && h <= UINT32_MAX) {
++		ret = bluejay_gpu_param((uint32_t)h, a->scalarOutput) ? kIOReturnSuccess : kIOReturnUnsupported;
++	} else if (selector == SWEET_GPU_CREATE_BO && a->scalarInputCount == 2 && a->scalarOutputCount == 4 && a->scalarInput[1] <= UINT32_MAX) {
++		ret = makeBO(h, (uint32_t)a->scalarInput[1], NULL, a->scalarOutput);
++	} else if (selector == SWEET_GPU_IMPORT_SURFACE && a->scalarInputCount == 1 && a->scalarOutputCount == 3 && h <= UINT32_MAX) {
++		SweetSurface *s = sweet_surface_copy((uint32_t)h);
++		if (s) {
++			ret = makeBO(s->memory ? s->memory->getLength() : 0, SWEET_GPU_BO_NOEXEC, s, a->scalarOutput);
++			s->release();
++		}
++	} else if (a->scalarInputCount == 1 && !a->scalarOutputCount && h && h < SWEET_GPU_MAX_HANDLES && fBO[h].memory) {
++		if (selector == SWEET_GPU_FREE_BO) {
++			ret = dropBO((uint32_t)h);
++		} else if (selector == SWEET_GPU_WAIT_BO || selector == SWEET_GPU_SYNC_BO) {
++			syncBO(&fBO[h]);
++			ret = kIOReturnSuccess;
++		}
++	}
++	IOLockUnlock(gpu_lock);
++	return ret;
++}
++
++void
++SweetGPUUserClient::cleanup()
++{
++	if (gpu_lock && fBO) {
++		IOLockLock(gpu_lock);
++		fClosed = true;
++		for (uint32_t h = 1; h < SWEET_GPU_MAX_HANDLES; h++) {
++			if (fBO[h].memory && dropBO(h) != kIOReturnSuccess) {
++				IOLog("BLUEJAY GPU: quarantine BO %u after failed hardware stop\n", h);
++			}
++		}
++		IOLockUnlock(gpu_lock);
++	}
++}
++
++IOReturn
++SweetGPUUserClient::clientClose()
++{
++	cleanup();
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++SweetGPUUserClient::free()
++{
++	if (fBO) {
++		if (!fClosed) {
++			cleanup();
++		}
++		IOFree(fBO, sizeof(*fBO) * SWEET_GPU_MAX_HANDLES);
++		fBO = NULL;
++	}
++	IOUserClient::free();
++}
++#endif
+diff --git a/iokit/Kernel/arm/SweetGPUABI.h b/iokit/Kernel/arm/SweetGPUABI.h
+new file mode 100644
+index 0000000..64b5d4b
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetGPUABI.h
+@@ -0,0 +1,36 @@
++/* Pixel Mali/Panfrost user-client contract. Shared by XNU and sweetgl. */
++#ifndef SWEET_GPU_ABI_H
++#define SWEET_GPU_ABI_H
++
++#include <stdint.h>
++
++#define SWEET_GPU_ABI_MAGIC 0x4d414c49u /* MALI; reject the unrelated MSM ABI */
++#define SWEET_GPU_ABI_VERSION 1u
++#define SWEET_GPU_MAX_HANDLES 4096u
++#define SWEET_GPU_MAX_SUBMIT_BOS 512u
++#define SWEET_GPU_MAX_BO_BYTES (128u << 20)
++#define SWEET_GPU_MAX_WIRED_BYTES (512u << 20)
++
++enum sweet_gpu_selector {
++	SWEET_GPU_CREATE_BO = 10, /* in: size, flags; out: handle, GPU VA, CPU VA, size */
++	SWEET_GPU_FREE_BO = 11,   /* in: handle */
++	SWEET_GPU_IMPORT_SURFACE = 12, /* in: IOSurface ID; out: handle, GPU VA, size */
++	SWEET_GPU_SUBMIT = 13,    /* struct sweet_gpu_submit + handles; synchronous */
++	SWEET_GPU_WAIT_BO = 14,   /* in: handle; completed synchronous work */
++	SWEET_GPU_INFO = 15,      /* out: magic, ABI version, full GPU_ID */
++	SWEET_GPU_SYNC_BO = 16,   /* in: handle; invalidate CPU caches after GPU work */
++	SWEET_GPU_GET_PARAM = 17, /* in: drm_panfrost_param; out: value */
++};
++
++/* CREATE_BO accepts Panfrost NOEXEC and HEAP. HEAP is eagerly backed. */
++#define SWEET_GPU_BO_NOEXEC 1u
++#define SWEET_GPU_BO_HEAP 2u
++
++struct sweet_gpu_submit {
++	uint64_t job;
++	uint32_t requirements;
++	uint32_t handle_count;
++	/* uint32_t handles[handle_count] immediately follow this header. */
++};
++
++#endif
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 index 0631685..87dac1c 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
@@ -2493,7 +3220,7 @@ index 0631685..87dac1c 100644
 +#include "SweetUSBNetwork.h"
  #endif /* SWEET */
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 7f90c56..e79f153 100644
+index 7f90c56..31b1539 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -39,6 +39,9 @@
@@ -2514,7 +3241,26 @@ index 7f90c56..e79f153 100644
  #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
  
  OSDefineMetaClassAndStructors(SweetSurface, OSObject);
-@@ -110,6 +114,54 @@ sweet_surface_seed(SweetSurface *s)
+@@ -84,6 +88,9 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (clientMemory && memory != NULL) {
++		memory->complete();
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -98,7 +105,7 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		kernelMap = memory->map(mapCache | (readOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -110,6 +117,54 @@ sweet_surface_seed(SweetSurface *s)
  	return (uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED);
  }
  
@@ -2569,16 +3315,17 @@ index 7f90c56..e79f153 100644
  /*
   * Give the surface an id and a table slot; the table holds one retain and a
   * user count (creators, client mappings, kernel holders). Lock held.
-@@ -211,6 +263,8 @@ sweet_surface_alloc(void)
+@@ -211,6 +266,9 @@ sweet_surface_alloc(void)
  		return NULL;
  	}
  	bzero(s->state->getBytesNoCopy(), page_size);
++	s->clientMemory = s->readOnly = false;
 +	s->webTrace = false;
 +	s->webTracePolls = s->webTraceCalls = 0;
  	return s;
  }
  
-@@ -316,7 +370,8 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -316,7 +374,8 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
  			}
  			p->width = sweet_dict_u32(pd, "IOSurfacePlaneWidth", s->width);
  			p->height = sweet_dict_u32(pd, "IOSurfacePlaneHeight", s->height);
@@ -2588,7 +3335,7 @@ index 7f90c56..e79f153 100644
  			p->elementWidth = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementWidth", 1);
  			p->elementHeight = (uint8_t)sweet_dict_u32(pd, "IOSurfacePlaneElementHeight", 1);
  			if (p->width > SWEET_SURFACE_MAX_DIM || p->height > SWEET_SURFACE_MAX_DIM ||
-@@ -393,6 +448,8 @@ IOCoreSurfaceRoot::start(IOService *provider)
+@@ -393,6 +452,8 @@ IOCoreSurfaceRoot::start(IOService *provider)
  		return false;
  	}
  	sweet_surface_init_lock();
@@ -2597,7 +3344,7 @@ index 7f90c56..e79f153 100644
  	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
  	registerService();
  	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
-@@ -405,6 +462,8 @@ class IOSurfaceRootUserClient : public IOUserClient {
+@@ -405,6 +466,8 @@ class IOSurfaceRootUserClient : public IOUserClient {
  	task_t   fTask;
  	IOLock  *fLock;
  	OSArray *fRefs;
@@ -2606,7 +3353,7 @@ index 7f90c56..e79f153 100644
  
  	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
  	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
-@@ -450,6 +509,10 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt3
+@@ -450,6 +513,10 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt3
  		return false;
  	}
  	fTask = owningTask;
@@ -2617,7 +3364,16 @@ index 7f90c56..e79f153 100644
  	fLock = IOLockAlloc();
  	fRefs = OSArray::withCapacity(16);
  	return fLock != NULL && fRefs != NULL;
-@@ -622,6 +685,7 @@ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
+@@ -527,7 +594,7 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache | (s->readOnly ? kIOMapReadOnly : 0));
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -622,6 +689,7 @@ sweet_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
  IOReturn
  IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
  {
@@ -2625,10 +3381,11 @@ index 7f90c56..e79f153 100644
  	SweetSurfaceRef *ref = NULL;
  	bool existing = false;
  	IOReturn ret = addRef(s, &ref, &existing);
-@@ -684,6 +748,47 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -684,7 +752,82 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  	}
  	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
  	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
 +	/* Diagnostic compatibility mode, off by default. iOS 16 WebKit reads
 +	 * IOSurfaceGetPixelFormat() back before selecting its CG context. Give
 +	 * that path a complete BGRA layout, before allocation or painting, rather
@@ -2670,10 +3427,45 @@ index 7f90c56..e79f153 100644
 +			bzero(s->planes, sizeof(s->planes));
 +		}
 +	}
- 	if (ret == kIOReturnSuccess) {
++	OSNumber *address = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && address != NULL) {
++		/* Based on ios-sailfish 0157-0159 (joranv1, with permission).
++		 * Preserve explicit row pitch and the creator's cache mode. A
++		 * decoded image may be read-only; preserve that in CPU/GPU maps.
++		 */
++		uint64_t addr = address->unsigned64BitValue(), start = trunc_page_64(addr);
++		uint64_t offset = (addr - start) + s->offset;
++		uint64_t span = offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++		uint64_t len = round_page_64(span);
++		bool valid = s->planeCount == 0 && addr != 0 && span <= SWEET_SURFACE_MAX_ALLOC &&
++		    len != 0 && len <= SWEET_SURFACE_MAX_ALLOC && start <= UINT64_MAX - len;
++		IOMemoryDescriptor *md = valid ? IOMemoryDescriptor::withAddressRange(start,
++		    len, kIODirectionInOut, fTask) : NULL;
++		if (md != NULL && md->prepare() != kIOReturnSuccess) {
++			md->release();
++			md = IOMemoryDescriptor::withAddressRange(start, len, kIODirectionOut, fTask);
++			if (md != NULL && md->prepare() != kIOReturnSuccess) {
++				OSSafeReleaseNULL(md);
++			}
++			s->readOnly = md != NULL;
++		}
++		if (md == NULL) {
++			ret = kIOReturnVMError;
++		} else {
++			s->memory = md;
++			s->clientMemory = true;
++			s->mapCache = kIOMapDefaultCache;
++			s->offset = (uint32_t)offset;
++			s->allocSize = (uint32_t)len;
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		}
++	} else if (ret == kIOReturnSuccess) {
  		IOBufferMemoryDescriptor *mem = NULL;
  		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
-@@ -727,6 +832,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+@@ -727,6 +870,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
      __unused void *reference)
  {
  	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
@@ -2685,7 +3477,7 @@ index 7f90c56..e79f153 100644
  
  	switch (selector) {
  	case kSweetSurfaceLimits: {
-@@ -767,6 +877,7 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -767,11 +915,16 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  			return kIOReturnNotFound;
  		}
  		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
@@ -2693,7 +3485,16 @@ index 7f90c56..e79f153 100644
  		args->scalarOutputCount = 1;
  		s->release();
  		sweet_surf_log_once("sel", selector);
-@@ -830,6 +941,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+ 		return kIOReturnSuccess;
+ 	}
++	case 6:
++	case 7:
++		/* Unsupported wraps must not return an unbacked success. */
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
+@@ -830,6 +983,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
  		return kIOReturnNotFound;
  	}
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
@@ -2701,7 +3502,7 @@ index 7f90c56..e79f153 100644
  	s->release();
  	return ret;
  }
-@@ -844,6 +956,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+@@ -844,6 +998,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
  	}
  	IOReturn ret = sweet_surface_seed_out(s, seedOut,
  	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
@@ -2710,19 +3511,20 @@ index 7f90c56..e79f153 100644
  	return ret;
  }
 diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
-index fbcdfac..97ec496 100644
+index fbcdfac..cbd1cdd 100644
 --- a/iokit/Kernel/arm/SweetSurface.h
 +++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -33,6 +33,8 @@ public:
+@@ -33,6 +33,9 @@ public:
  	uint16_t bytesPerElement;
  	uint8_t  elementWidth, elementHeight;
  	uint32_t cacheMode, planeCount, parentID;
++	bool clientMemory, readOnly;
 +	bool webTrace;
 +	uint32_t webTracePolls, webTraceCalls;
  	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
  
  	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
-@@ -50,6 +52,9 @@ public:
+@@ -50,6 +53,9 @@ public:
  /* Retained surface for an id, or NULL. */
  SweetSurface *sweet_surface_copy(uint32_t id);
  
@@ -2732,6 +3534,32 @@ index fbcdfac..97ec496 100644
  /*
   * Publish physical memory (the panel framebuffer) as a surface. Returns a
   * retained surface that stays in the id table until released by the caller
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e26..f652e39 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetGPU;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetGPU;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..1c63209 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -20,3 +20,5 @@ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitc
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++
++iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
 diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
 index 44f005f..87e9a13 100644
 --- a/makedefs/MakeInc.def

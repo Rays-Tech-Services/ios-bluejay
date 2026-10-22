@@ -182,3 +182,29 @@ automatic operation, manual retry, stack timeout, failed L2, invalid/absent
 stacks and failed resets; hardware is mocked. Source: Google GPU module
 commit `20fff721667a227b3d6decf9dbc3798476390302`,
 `mali_kbase/backend/gpu/mali_kbase_pm_driver.c`.
+
+## Renderer-enabled draft
+
+CI `39733290573` (commit `35905e5`) built and ad-hoc signed the arm64 iOS
+Panfrost library successfully. Artifact `out/ci-sweetgl-v5/sweetgl/sweetgl.dylib`
+SHA256: `30e27db78df22be92be79ef77b64c6e049d862db3094b77e145c70aa0d6cfc25`.
+This is build evidence, not phone rendering evidence.
+
+Ray requested the next phone boot attempt full acceleration. The opt-in
+`sweetgpu=4` draft runs power-up and WRITE_VALUE before enabling the SweetGPU
+user address space. The service exposes the shared ABI to administrator
+clients, limits wired memory to 512MiB, preserves read-only IOSurface pages,
+maps 16KiB host pages as 4KiB GPU PTEs, and adds a guard after each allocation.
+Submissions are serialized and synchronous (fragment JS0, other JS1). A fault
+disables submissions and attempts a bounded hard reset. If reset is unconfirmed,
+client teardown retains wired buffers instead of freeing possible DMA targets.
+The single GPU address space is experimental and restricted to trusted root
+clients; it does not provide per-client GPU isolation.
+
+The draft also adapts ios-sailfish 0152/0157/0158 behavior: unsupported surface
+wrap selectors fail; client-address images retain their cache mode and exact
+row pitch, with read-only wiring fallback and balanced prepare/complete.
+The backend host harness exercises exported code under ASan/UBSan with mocked
+MMIO: parameters, invalid pages, PTE permissions/subpages, guard/reuse, slots,
+timeouts, reset failure and quarantine. These tests cannot establish hardware
+correctness. Kernel CI/QEMU, deployment and physical rendering remain pending.

@@ -85,6 +85,8 @@ static void thread_block(void *continuation) { assert(!continuation); }
 static uint32_t gpu_rd(uint32_t offset) { assert(offset == GPU_ID); return *(uint32_t *)gpu; }
 static void bg_features(void) { features++; }
 static bool bg_power(void) { powers++; return power_ok; }
+static bool bg_job_success;
+static bool bv_init(void) { return true; }
 static void bg_job_test(void) { jobs++; }
 static int kernel_thread_start(void (*fn)(void *, int), void *arg, thread_t *thread) {
     starts++; if (fail_start) return 1; *thread = 1; fn(arg, 0); return 0;
