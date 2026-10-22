@@ -12,10 +12,14 @@ meson introspect "$B" --targets > "$O/targets.json"
 python3 - "$B" "$O" <<'PY'
 import json, pathlib, shlex, subprocess, sys
 b, out = map(pathlib.Path, sys.argv[1:])
+renderer_roots = ('src/mesa/', 'src/mapi/', 'src/gallium/auxiliary/',
+                  'src/gallium/drivers/panfrost/', 'src/gallium/winsys/panfrost/',
+                  'src/panfrost/', 'src/compiler/', 'src/util/', 'src/c11/')
 archives = sorted({str(pathlib.Path(f).relative_to(b))
     for target in json.loads(out.joinpath('targets.json').read_text())
     if target['type'] == 'static library'
-    for f in target['filename'] if f.endswith('.a')})
+    for f in target['filename'] if f.endswith('.a')
+    and str(pathlib.Path(f).relative_to(b)).startswith(renderer_roots)})
 if not archives:
     raise SystemExit('No Mesa static archives configured')
 subprocess.run(['ninja', '-C', str(b), *archives], check=True)
