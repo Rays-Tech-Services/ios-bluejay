@@ -1690,7 +1690,7 @@ index d8a7f5a..f43e4f9 100644
  void
  AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..b920674 100644
+index 0631685..f61bbec 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -9,6 +9,7 @@
@@ -1709,7 +1709,7 @@ index 0631685..b920674 100644
  };
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
-@@ -34,6 +36,54 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -34,6 +36,67 @@ SweetPlatformExpert::start(IOService *provider)
  	return true;
  }
  
@@ -1722,6 +1722,7 @@ index 0631685..b920674 100644
 +#define BLUEJAY_PMU_SYSIP_DAT0          (0x17460000ULL + 0x810)
 +#define BLUEJAY_REBOOT_BOOTLOADER       0xfc
 +#define TENSOR_SMC_PMU_SEC_REG          0x82000504ULL
++#define PSCI_SYSTEM_OFF                 0x84000008ULL
 +#define PSCI_SYSTEM_RESET               0x84000009ULL
 +
 +static uint64_t
@@ -1741,6 +1742,9 @@ index 0631685..b920674 100644
 +/*
 + * sweetreboot=1 (bluejay test images): iOS restart and power off both reset
 + * into the bootloader, so the next `fastboot boot` needs no button combo.
++ * Otherwise power off is PSCI SYSTEM_OFF and restart is PSCI SYSTEM_RESET.
++ * The default path only parks the CPU, so PEHaltRestart's 30 s timer
++ * panicked "Halt/Restart Timed Out"; if SYSTEM_OFF returns, reset instead.
 + * Panics keep the default path (their text stays on the screen).
 + */
 +int
@@ -1756,6 +1760,15 @@ index 0631685..b920674 100644
 +		    BLUEJAY_REBOOT_BOOTLOADER);
 +		bluejay_smc(PSCI_SYSTEM_RESET, 0, 0, 0);
 +		IOLog("SWEET: PSCI SYSTEM_RESET returned (mode write %llx)\n", r);
++	} else if (type == kPEHaltCPU) {
++		IOLog("SWEET: power off -> PSCI SYSTEM_OFF\n");
++		uint64_t r = bluejay_smc(PSCI_SYSTEM_OFF, 0, 0, 0);
++		IOLog("SWEET: PSCI SYSTEM_OFF returned %llx, resetting\n", r);
++		bluejay_smc(PSCI_SYSTEM_RESET, 0, 0, 0);
++	} else if (type == kPERestartCPU) {
++		IOLog("SWEET: restart -> PSCI SYSTEM_RESET\n");
++		bluejay_smc(PSCI_SYSTEM_RESET, 0, 0, 0);
++		IOLog("SWEET: PSCI SYSTEM_RESET returned\n");
 +	}
 +#endif
 +	return IODTPlatformExpert::haltRestart(type);
@@ -1764,7 +1777,7 @@ index 0631685..b920674 100644
  const char *
  SweetPlatformExpert::deleteList(void)
  {
-@@ -79,4 +129,5 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+@@ -79,4 +142,5 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
   * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
   * is what the iPhone userland (MobileGestalt) expects.
   */
