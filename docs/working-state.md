@@ -719,3 +719,16 @@ CTRL 0x58 = external pin, 750 mV. Conclusion: the shader-core rail is off;
 ABL powers only the L2 rail. Linux panfrost enables all four GPU supplies
 through the regulator framework; our kernel enables none. Next: one PMIC
 write, BUCK2S CTRL bits 7:6 = 11 (on), then the level-2 power test.
+
+Shader rail fix verified (2026-10-22 16:04, physical phone): commit da68a51,
+CI kernel SHA256 `c6b8b422a9401773aa89bfa1879a2275337c346028c1ecbdb7c01459cd19baa1`,
+image out/phone-gpu-rail/boot.img SHA256
+`92655e5bb67850c5f0d5346208c9dadc3a3cbf6eee54197daaa9095147038501`
+(`sweetgpu=2 sweetgpuprobe=1 sweetgpurail=1`, read-only, no iOS). Log
+out/gpu-rail-phone.log. BUCK2S enable: CTRL 0x38 -> 0xf9 (bits 7:6 = on;
+bit 0 also reads 1 afterwards, probably a status bit, unconfirmed), 600 mV.
+Power test: **L2 ok (0x1), shader ok (0x779fff, all 20 cores), tiler ok
+(0x1)** -- the first shader power-up on this phone. Phone returned to
+fastboot after the countdown. Next: level 3 (AS0 + WRITE_VALUE job), then
+make the rail enable part of normal GPU bring-up (sweetgpu>=2) and retry
+the renderer boot with the sweetgl no-GPU fallback.
