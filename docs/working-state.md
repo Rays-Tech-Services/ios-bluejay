@@ -762,3 +762,15 @@ out/root-gpu2.simg SHA256
 GPU iOS boot image out/phone-gpu-ios/boot.img SHA256
 `5fd56514ab53cdba506b86e9e06f1e90acf99a1e2569e34ea2a86106198589c3`
 (Codex's renderer cmdline on the new kernel). Not flashed; needs Ray's OK.
+
+First GPU iOS boot with the shader rail (2026-10-22 16:58): new root
+root-gpu2.simg flashed (91/91 OKAY, 371 s, out/gpu2-userdata-flash.log),
+fixer boot back in fastboot after ~5.7 min, then out/phone-gpu-ios/boot.img
+(`5fd56514...89c3`). backboardd opened SweetGPU (`open SweetGPU type 0 -> 0x0`,
+first successful open) and sweetgl installed its EAGL shim, then the kernel
+panicked: `phystokv_range: illegal PA 0xc2468000; phys base 0x880000000, size
+0xe0000000 @arm_vm_init.c:406` (Ray's photo IMG_5962; no USB log, iOS
+networking was not up yet). Cause: SweetGPU syncBO() cleans caches by
+physical address, and the imported display surface is SweetFramebuffer's
+physical framebuffer outside XNU's managed RAM. Fix: skip pages that fail
+pmap_valid_address() (that memory is mapped write-combined, never cached).

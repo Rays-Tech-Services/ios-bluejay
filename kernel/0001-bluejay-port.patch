@@ -2998,10 +2998,10 @@ index d8a7f5a..537f75b 100644
  AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
 new file mode 100644
-index 0000000..e69f4cb
+index 0000000..16ae782
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,386 @@
 +/* Pixel Mali-G78 IOKit bridge. ABI and synchronous buffer/submit design follow
 + * joranv1's ios-sailfish SweetGPU, reused with permission; Mali backend is new.
 + * Experimental opt-in sweetgpu=4; administrator/backboardd clients only. No service on QEMU.
@@ -3131,11 +3131,21 @@ index 0000000..e69f4cb
 +	return fBO != NULL;
 +}
 +
++extern "C" boolean_t pmap_valid_address(uint64_t addr);
++
++/*
++ * Clean CPU caches over a buffer by physical address. Only kernel-managed
++ * RAM can be: the display surface (SweetFramebuffer's physical framebuffer,
++ * outside XNU's range) is mapped write-combined and never in the caches,
++ * and flush_dcache64 on it panics in phystokv_range.
++ */
 +static void
 +syncBO(SweetBO *bo)
 +{
 +	for (uint32_t p = 0; p < bo->count; p++) {
-+		flush_dcache64((addr64_t)bo->pages[p], PAGE_SIZE, TRUE);
++		if (pmap_valid_address(bo->pages[p])) {
++			flush_dcache64((addr64_t)bo->pages[p], PAGE_SIZE, TRUE);
++		}
 +	}
 +}
 +
