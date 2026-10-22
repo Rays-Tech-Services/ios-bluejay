@@ -16,6 +16,7 @@
 #define DRM_NODE_CONTROL 1
 #define DRM_NODE_RENDER  2
 #define DRM_NODE_MAX     3
+#define DRM_DIR_NAME "/dev/dri"
 
 typedef struct _drmVersion {
 	int version_major, version_minor, version_patchlevel;
