@@ -133,10 +133,10 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..1730678
+index 0000000..59a23fb
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,417 @@
 +/*
 + * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
 + * sweetgpu=N, run once after the root mounts, everything logged:
@@ -175,6 +175,7 @@ index 0000000..1730678
 +#define G3D_PMU_STATUS_PA       0x17462004ULL   /* gpu_pmu_status_reg_offset */
 +#define GPU_PA                  0x1c500000ULL
 +#define GPU_SIZE                0x8000
++#define TENSOR_SMC_PMU_SEC_REG   0x82000504ULL
 +
 +#define GPU_ID                  0x000
 +#define GPU_L2_FEATURES         0x004
@@ -279,6 +280,20 @@ index 0000000..1730678
 +#define BG_MAGIC                0xcafef00dU
 +
 +static vm_offset_t bg_regs;
++
++/* Same firmware PMU read ABI used by bluejay's verified PS_HOLD path. */
++static uint64_t
++bg_pmu_read(uint64_t address)
++{
++	register uint64_t x0 __asm__("x0") = TENSOR_SMC_PMU_SEC_REG;
++	register uint64_t x1 __asm__("x1") = address;
++	register uint64_t x2 __asm__("x2") = 0; /* read */
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
++	    "x14", "x15", "x16", "x17", "memory");
++	return x0;
++}
 +
 +static uint32_t
 +gpu_rd(uint32_t off)
@@ -465,27 +480,34 @@ index 0000000..1730678
 +		seconds = 0;
 +	}
 +	if (seconds != 0) {
++		printf("BLUEJAY GPU: level %d waiting %d seconds before PMU probe\n", level, seconds);
 +		assert_wait_timeout((event_t)&bg_regs, THREAD_UNINT,
 +		    (uint32_t)seconds * 1000, NSEC_PER_MSEC);
 +		thread_block(THREAD_CONTINUE_NULL);
 +	}
 +
-+	vm_offset_t pd = ml_io_map(PD_G3D_PA & ~0x3fffULL, 0x4000);
-+	if (!pd) {
++	printf("BLUEJAY GPU: starting level %d; reading PMU through firmware\n", level);
++	uint64_t cfg = bg_pmu_read(PD_G3D_PA);
++	printf("BLUEJAY GPU: PD_G3D config SMC 0x%llx\n", cfg);
++	uint64_t st = bg_pmu_read(PD_G3D_PA + 4);
++	printf("BLUEJAY GPU: PD_G3D status SMC 0x%llx\n", st);
++	uint64_t cores = bg_pmu_read(G3D_PMU_STATUS_PA);
++	printf("BLUEJAY GPU: G3D cores status SMC 0x%llx\n", cores);
++	if (cfg > UINT32_MAX || st > UINT32_MAX || cores > UINT32_MAX ||
++	    cfg == UINT32_MAX || st == UINT32_MAX || cores == UINT32_MAX) {
++		printf("BLUEJAY GPU: firmware PMU read failed; GPU not touched\n");
 +		return;
 +	}
-+	volatile uint32_t *pdr = (volatile uint32_t *)(pd + (PD_G3D_PA & 0x3fff));
-+	uint32_t cfg = pdr[0], st = pdr[1];
-+	uint32_t cores = *(volatile uint32_t *)(pd + (G3D_PMU_STATUS_PA & 0x3fff));
-+	printf("BLUEJAY GPU: PD_G3D config 0x%x status 0x%x, G3D cores status 0x%x\n", cfg, st, cores);
 +	if (!(st & 1)) {
 +		printf("BLUEJAY GPU: G3D power domain is off; GPU not touched\n");
 +		return;
 +	}
 +	bg_regs = ml_io_map(GPU_PA, GPU_SIZE);
 +	if (!bg_regs) {
++		printf("BLUEJAY GPU: failed to map GPU registers\n");
 +		return;
 +	}
++	printf("BLUEJAY GPU: domain on; reading GPU_ID\n");
 +	uint32_t id = gpu_rd(GPU_ID);
 +	if (id == 0 || id == 0xffffffffu) {
 +		printf("BLUEJAY GPU: GPU_ID reads 0x%x; stopping\n", id);
@@ -508,17 +530,27 @@ index 0000000..1730678
 +{
 +	int level = 0;
 +	DTEntry bj;
-+	uint32_t const *qemu;
-+	unsigned qsz;
++	uint32_t const *qemu = NULL;
++	unsigned qsz = 0;
 +
-+	PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
-+	if (level <= 0 || SecureDTLookupEntry(NULL, "/bluejay", &bj) != kSuccess ||
-+	    SecureDTGetProperty(bj, "qemu", (void const **)&qemu, &qsz) != kSuccess ||
++	boolean_t requested = PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
++	printf("BLUEJAY GPU: requested %d level %d\n", requested, level);
++	if (level <= 0) {
++		return;
++	}
++	if (SecureDTLookupEntry(NULL, "/bluejay", &bj) != kSuccess) {
++		printf("BLUEJAY GPU: skipped: no bluejay device-tree node\n");
++		return;
++	}
++	if (SecureDTGetProperty(bj, "qemu", (void const **)&qemu, &qsz) != kSuccess ||
 +	    qsz != 4 || *qemu != 0) {
++		printf("BLUEJAY GPU: skipped: absent, invalid or emulated board marker\n");
 +		return;
 +	}
 +	thread_t th;
-+	if (kernel_thread_start(bluejay_gpu_thread, (void *)(uintptr_t)level, &th) == KERN_SUCCESS) {
++	kern_return_t kr = kernel_thread_start(bluejay_gpu_thread, (void *)(uintptr_t)level, &th);
++	printf("BLUEJAY GPU: start level %d thread result %d\n", level, kr);
++	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(th);
 +	}
 +}
