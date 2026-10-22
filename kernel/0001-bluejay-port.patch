@@ -1,12 +1,13 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index bf085da..2f71133 100644
+index bf085da..6923a36 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+@@ -108,6 +108,8 @@ bsd/dev/sweet_ufs.c			standard
  bsd/dev/a40_blk.c			standard
  bsd/dev/a40_keys.c			standard
  bsd/dev/a40_touch.c			standard
 +bsd/dev/bluejay_touch.c			standard
++bsd/dev/bluejay_gpu.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
@@ -130,6 +131,384 @@ index c640939..a2c2826 100644
  	if (SecureDTLookupEntry(NULL, "/a40-touch", &node) != kSuccess) {
  		extern int a40_platform(void);
  		return a40_platform();
+diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
+new file mode 100644
+index 0000000..236963b
+--- /dev/null
++++ b/bsd/dev/bluejay_gpu.c
+@@ -0,0 +1,372 @@
++/*
++ * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
++ * sweetgpu=N, run once after the root mounts, everything logged:
++ *
++ *   1  PD_G3D status, then (only if the domain is on) the GPU's ID and
++ *      feature registers. Read-only.
++ *   2  + soft reset, quirks, power on L2 / shader cores / tiler.
++ *   3  + AS0 with AArch64 4K page tables (GPU_QUIRK_FORCE_AARCH64_PGTABLE:
++ *      the G78 faults on legacy Mali LPAE tables) and one WRITE_VALUE job on
++ *      job slot 1; checks the GPU wrote the value through its MMU.
++ *
++ * Hardware facts: Google gs101.dtsi / gs101-pm-domains.dtsi (pd-g3d at PMU
++ * 0x17461e00), the Pixel 6 panfrost patches (GPU at 0x1c500000, ID 0x9202,
++ * rails and G3D clock left on by the bootloader), Linux panfrost_regs.h /
++ * panfrost_gpu.c / panfrost_mmu.c / panfrost_job.c and Mesa genxml v9.xml.
++ * Interrupts stay masked: everything is polled.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++
++#define PD_G3D_PA               0x17461e00ULL
++#define G3D_PMU_STATUS_PA       0x17462004ULL   /* gpu_pmu_status_reg_offset */
++#define GPU_PA                  0x1c500000ULL
++#define GPU_SIZE                0x8000
++
++#define GPU_ID                  0x000
++#define GPU_L2_FEATURES         0x004
++#define GPU_CORE_FEATURES       0x008
++#define GPU_TILER_FEATURES      0x00c
++#define GPU_MEM_FEATURES        0x010
++#define GPU_MMU_FEATURES        0x014
++#define GPU_AS_PRESENT          0x018
++#define GPU_JS_PRESENT          0x01c
++#define GPU_INT_RAWSTAT         0x020
++#define GPU_INT_CLEAR           0x024
++#define GPU_INT_MASK            0x028
++#define   GPU_IRQ_RESET_COMPLETED       (1u << 8)
++#define GPU_CMD                 0x030
++#define   GPU_CMD_SOFT_RESET            0x01
++#define   GPU_CMD_HARD_RESET            0x02
++#define GPU_STATUS              0x034
++#define GPU_FAULT_STATUS        0x03c
++#define GPU_FAULT_ADDRESS_LO    0x040
++#define GPU_THREAD_FEATURES     0x0ac
++#define GPU_SHADER_PRESENT_LO   0x100
++#define GPU_SHADER_PRESENT_HI   0x104
++#define GPU_TILER_PRESENT_LO    0x110
++#define GPU_L2_PRESENT_LO       0x120
++#define SHADER_READY_LO         0x140
++#define TILER_READY_LO          0x150
++#define L2_READY_LO             0x160
++#define SHADER_PWRON_LO         0x180
++#define SHADER_PWRON_HI         0x184
++#define TILER_PWRON_LO          0x190
++#define L2_PWRON_LO             0x1a0
++#define GPU_COHERENCY_FEATURES  0x300
++#define GPU_COHERENCY_ENABLE    0x304
++#define   COHERENCY_NONE                31
++#define GPU_STACK_PRESENT_LO    0xe00
++#define GPU_JM_CONFIG           0xf00
++#define GPU_SHADER_CONFIG       0xf04
++#define   SC_VAR_ALGORITHM              (1u << 29)      /* HW_ISSUE_TTRX_2968_TTRX_3162 */
++#define   JM_IDVS_GROUP_SIZE_SHIFT      16
++#define   JM_DEFAULT_IDVS_GROUP_SIZE    0xf
++
++#define JOB_INT_RAWSTAT         0x1000
++#define JOB_INT_CLEAR           0x1004
++#define JOB_INT_MASK            0x1008
++#define JS_BASE                 0x1800
++#define JS_REG(n, r)            (JS_BASE + (n) * 0x80 + (r))
++#define JS_HEAD_LO              0x00
++#define JS_STATUS               0x24
++#define JS_HEAD_NEXT_LO         0x40
++#define JS_HEAD_NEXT_HI         0x44
++#define JS_AFFINITY_NEXT_LO     0x50
++#define JS_AFFINITY_NEXT_HI     0x54
++#define JS_CONFIG_NEXT          0x58
++#define JS_COMMAND_NEXT         0x60
++#define   JS_COMMAND_START              0x01
++#define   JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE (3u << 8)
++#define   JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE   (3u << 12)
++#define   JS_CONFIG_THREAD_PRI(n)       ((n) << 16)
++
++#define MMU_INT_RAWSTAT         0x2000
++#define MMU_INT_CLEAR           0x2004
++#define MMU_INT_MASK            0x2008
++#define AS_REG(as, r)           (0x2400 + ((as) << 6) + (r))
++#define AS_TRANSTAB_LO          0x00
++#define AS_TRANSTAB_HI          0x04
++#define AS_MEMATTR_LO           0x08
++#define AS_MEMATTR_HI           0x0c
++#define AS_COMMAND              0x18
++#define   AS_COMMAND_UPDATE             0x01
++#define   AS_COMMAND_FLUSH_MEM          0x05
++#define AS_FAULTSTATUS          0x1c
++#define AS_FAULTADDRESS_LO      0x20
++#define AS_FAULTADDRESS_HI      0x24
++#define AS_STATUS               0x28
++#define   AS_STATUS_AS_ACTIVE           0x01
++#define AS_TRANSCFG_LO          0x30
++#define AS_TRANSCFG_HI          0x34
++#define   AS_TRANSCFG_ADRMODE_AARCH64_4K (6u << 0)
++#define   AS_TRANSCFG_INA_BITS(x)       ((x) << 6)
++#define   AS_TRANSCFG_PTW_MEMATTR_NC    (1u << 24)
++#define   AS_TRANSCFG_PTW_RA            (1u << 30)
++
++/* AArch64 stage-1 descriptors (io-pgtable-arm.c) */
++#define PTE_TABLE               3ULL
++#define PTE_PAGE                3ULL
++#define PTE_AF                  (1ULL << 10)
++#define PTE_SH_OS               (2ULL << 8)
++#define PTE_AP_UNPRIV           (1ULL << 6)
++/* Every MEMATTR slot: inner/outer non-cacheable, Midgard inner shareable,
++ * explicit no-allocate (panfrost mair_to_memattr for a non-cacheable MAIR). */
++#define MEMATTR_NC_ALL          0x4c4c4c4c4c4c4c4cULL
++
++/* Self-test memory: four page-table levels, a job page, a target page. */
++#define BG_SIZE                 (32 * 1024)
++#define BG_L0                   0x0000
++#define BG_L1                   0x1000
++#define BG_L2                   0x2000
++#define BG_L3                   0x3000
++#define BG_JOB                  0x4000
++#define BG_TARGET               0x5000
++#define BG_VA                   0x1000000ULL    /* GPU VA of the job page */
++#define BG_MAGIC                0xcafef00dU
++
++static vm_offset_t bg_regs;
++
++static uint32_t
++gpu_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(bg_regs + off);
++}
++
++static void
++gpu_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(bg_regs + off) = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/* Poll until (reg & mask) == want, up to ms milliseconds. */
++static bool
++gpu_poll(uint32_t off, uint32_t mask, uint32_t want, unsigned ms)
++{
++	for (unsigned i = 0; i < ms * 10; i++) {
++		if ((gpu_rd(off) & mask) == want) {
++			return true;
++		}
++		delay(100);
++	}
++	return false;
++}
++
++static void
++bg_features(void)
++{
++	printf("BLUEJAY GPU: ID 0x%08x L2 0x%08x CORE 0x%08x TILER 0x%08x MEM 0x%08x MMU 0x%08x\n",
++	    gpu_rd(GPU_ID), gpu_rd(GPU_L2_FEATURES), gpu_rd(GPU_CORE_FEATURES),
++	    gpu_rd(GPU_TILER_FEATURES), gpu_rd(GPU_MEM_FEATURES), gpu_rd(GPU_MMU_FEATURES));
++	printf("BLUEJAY GPU: AS 0x%x JS 0x%x shader 0x%08x%08x tiler 0x%x L2 0x%x stack 0x%x coherency 0x%x thread 0x%x\n",
++	    gpu_rd(GPU_AS_PRESENT), gpu_rd(GPU_JS_PRESENT), gpu_rd(GPU_SHADER_PRESENT_HI),
++	    gpu_rd(GPU_SHADER_PRESENT_LO), gpu_rd(GPU_TILER_PRESENT_LO), gpu_rd(GPU_L2_PRESENT_LO),
++	    gpu_rd(GPU_STACK_PRESENT_LO), gpu_rd(GPU_COHERENCY_FEATURES), gpu_rd(GPU_THREAD_FEATURES));
++	printf("BLUEJAY GPU: status 0x%x ready L2 0x%x shader 0x%x tiler 0x%x, int raw gpu 0x%x job 0x%x mmu 0x%x\n",
++	    gpu_rd(GPU_STATUS), gpu_rd(L2_READY_LO), gpu_rd(SHADER_READY_LO), gpu_rd(TILER_READY_LO),
++	    gpu_rd(GPU_INT_RAWSTAT), gpu_rd(JOB_INT_RAWSTAT), gpu_rd(MMU_INT_RAWSTAT));
++}
++
++static bool
++bg_power(void)
++{
++	gpu_wr(GPU_INT_MASK, 0);
++	gpu_wr(JOB_INT_MASK, 0);
++	gpu_wr(MMU_INT_MASK, 0);
++	gpu_wr(GPU_INT_CLEAR, GPU_IRQ_RESET_COMPLETED);
++	gpu_wr(GPU_CMD, GPU_CMD_SOFT_RESET);
++	if (!gpu_poll(GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 10)) {
++		printf("BLUEJAY GPU: soft reset timed out, trying hard reset\n");
++		gpu_wr(GPU_CMD, GPU_CMD_HARD_RESET);
++		if (!gpu_poll(GPU_INT_RAWSTAT, GPU_IRQ_RESET_COMPLETED, GPU_IRQ_RESET_COMPLETED, 100)) {
++			printf("BLUEJAY GPU: hard reset timed out\n");
++			return false;
++		}
++	}
++	gpu_wr(GPU_INT_CLEAR, 0xffffffffu);
++	gpu_wr(JOB_INT_CLEAR, 0xffffffffu);
++	gpu_wr(MMU_INT_CLEAR, 0xffffffffu);
++	printf("BLUEJAY GPU: reset done\n");
++
++	/* panfrost_gpu_init_quirks for a v9 G78: IDVS group size, TTRX_2968 */
++	gpu_wr(GPU_JM_CONFIG, gpu_rd(GPU_JM_CONFIG) | (JM_DEFAULT_IDVS_GROUP_SIZE << JM_IDVS_GROUP_SIZE_SHIFT));
++	gpu_wr(GPU_SHADER_CONFIG, gpu_rd(GPU_SHADER_CONFIG) | SC_VAR_ALGORITHM);
++	gpu_wr(GPU_COHERENCY_ENABLE, COHERENCY_NONE);
++
++	uint32_t l2 = gpu_rd(GPU_L2_PRESENT_LO), sh = gpu_rd(GPU_SHADER_PRESENT_LO);
++	uint32_t shhi = gpu_rd(GPU_SHADER_PRESENT_HI), ti = gpu_rd(GPU_TILER_PRESENT_LO);
++	gpu_wr(L2_PWRON_LO, l2);
++	bool ok_l2 = gpu_poll(L2_READY_LO, 0xffffffffu, l2, 20);
++	gpu_wr(SHADER_PWRON_LO, sh);
++	gpu_wr(SHADER_PWRON_HI, shhi);
++	bool ok_sh = gpu_poll(SHADER_READY_LO, 0xffffffffu, sh, 20);
++	gpu_wr(TILER_PWRON_LO, ti);
++	bool ok_ti = gpu_poll(TILER_READY_LO, 0xffffffffu, ti, 20);
++	printf("BLUEJAY GPU: power on L2 %s (0x%x) shader %s (0x%x) tiler %s (0x%x)\n",
++	    ok_l2 ? "ok" : "TIMEOUT", gpu_rd(L2_READY_LO), ok_sh ? "ok" : "TIMEOUT",
++	    gpu_rd(SHADER_READY_LO), ok_ti ? "ok" : "TIMEOUT", gpu_rd(TILER_READY_LO));
++	return ok_l2 && ok_sh;
++}
++
++static bool
++bg_as_cmd(uint32_t cmd)
++{
++	if (!gpu_poll(AS_REG(0, AS_STATUS), AS_STATUS_AS_ACTIVE, 0, 10)) {
++		printf("BLUEJAY GPU: AS0 busy before command %u\n", cmd);
++		return false;
++	}
++	gpu_wr(AS_REG(0, AS_COMMAND), cmd);
++	return gpu_poll(AS_REG(0, AS_STATUS), AS_STATUS_AS_ACTIVE, 0, 10);
++}
++
++static void
++bg_job_test(void)
++{
++	vm_offset_t mem = 0;
++	if (kmem_alloc_contig(kernel_map, &mem, BG_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("BLUEJAY GPU: no memory for the job test\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)mem);
++	if (!pn) {
++		return;
++	}
++	uint64_t pa = ptoa_64(pn);
++	uint64_t *l0 = (uint64_t *)(mem + BG_L0), *l1 = (uint64_t *)(mem + BG_L1);
++	uint64_t *l2 = (uint64_t *)(mem + BG_L2), *l3 = (uint64_t *)(mem + BG_L3);
++	uint32_t va_bits = gpu_rd(GPU_MMU_FEATURES) & 0xff;
++	if (va_bits < 33 || va_bits > 48) {
++		va_bits = 48;
++	}
++	/* 4 levels above 39 bits (L0 first), else L1 is the top table. */
++	bool four = va_bits > 39;
++	if (four) {
++		l0[(BG_VA >> 39) & 511] = (pa + BG_L1) | PTE_TABLE;
++	}
++	l1[(BG_VA >> 30) & 511] = (pa + BG_L2) | PTE_TABLE;
++	l2[(BG_VA >> 21) & 511] = (pa + BG_L3) | PTE_TABLE;
++	/* VA BG_VA -> job page, BG_VA + 4K -> target page */
++	l3[((BG_VA >> 12) & 511) + 0] = (pa + BG_JOB) | PTE_PAGE | PTE_AF | PTE_SH_OS | PTE_AP_UNPRIV;
++	l3[((BG_VA >> 12) & 511) + 1] = (pa + BG_TARGET) | PTE_PAGE | PTE_AF | PTE_SH_OS | PTE_AP_UNPRIV;
++
++	/* WRITE_VALUE job: header (32 B) + payload, Mesa genxml v9 */
++	uint32_t *job = (uint32_t *)(mem + BG_JOB);
++	job[4] = 1u | (2u << 1) | (1u << 16);           /* 64-bit, type Write value, index 1 */
++	uint64_t target_va = BG_VA + 0x1000;
++	job[8] = (uint32_t)target_va;                   /* payload: address */
++	job[9] = (uint32_t)(target_va >> 32);
++	job[10] = 6;                                    /* Immediate 32 */
++	job[12] = BG_MAGIC;                             /* immediate value */
++	*(volatile uint32_t *)(mem + BG_TARGET) = 0x11111111;
++	flush_dcache64((addr64_t)pa, BG_SIZE, TRUE);
++
++	uint64_t transtab = pa + (four ? BG_L0 : BG_L1);
++	uint64_t transcfg = AS_TRANSCFG_ADRMODE_AARCH64_4K | AS_TRANSCFG_INA_BITS(55 - va_bits) |
++	    AS_TRANSCFG_PTW_MEMATTR_NC | AS_TRANSCFG_PTW_RA;
++	bg_as_cmd(AS_COMMAND_FLUSH_MEM);
++	gpu_wr(AS_REG(0, AS_TRANSTAB_LO), (uint32_t)transtab);
++	gpu_wr(AS_REG(0, AS_TRANSTAB_HI), (uint32_t)(transtab >> 32));
++	gpu_wr(AS_REG(0, AS_MEMATTR_LO), (uint32_t)MEMATTR_NC_ALL);
++	gpu_wr(AS_REG(0, AS_MEMATTR_HI), (uint32_t)(MEMATTR_NC_ALL >> 32));
++	gpu_wr(AS_REG(0, AS_TRANSCFG_LO), (uint32_t)transcfg);
++	gpu_wr(AS_REG(0, AS_TRANSCFG_HI), (uint32_t)(transcfg >> 32));
++	bool as_ok = bg_as_cmd(AS_COMMAND_UPDATE);
++	printf("BLUEJAY GPU: AS0 %s, %u-bit VA, %d levels, transtab 0x%llx transcfg 0x%llx\n",
++	    as_ok ? "set" : "UPDATE TIMEOUT", va_bits, four ? 4 : 3, transtab, transcfg);
++
++	gpu_wr(JOB_INT_CLEAR, 0xffffffffu);
++	gpu_wr(JS_REG(1, JS_HEAD_NEXT_LO), (uint32_t)BG_VA);
++	gpu_wr(JS_REG(1, JS_HEAD_NEXT_HI), (uint32_t)(BG_VA >> 32));
++	gpu_wr(JS_REG(1, JS_AFFINITY_NEXT_LO), gpu_rd(GPU_SHADER_PRESENT_LO));
++	gpu_wr(JS_REG(1, JS_AFFINITY_NEXT_HI), gpu_rd(GPU_SHADER_PRESENT_HI));
++	gpu_wr(JS_REG(1, JS_CONFIG_NEXT), 0 /* AS0 */ | JS_CONFIG_THREAD_PRI(8) |
++	    JS_CONFIG_START_FLUSH_CLEAN_INVALIDATE | JS_CONFIG_END_FLUSH_CLEAN_INVALIDATE);
++	gpu_wr(JS_REG(1, JS_COMMAND_NEXT), JS_COMMAND_START);
++	/* JOB_INT bit 1 = slot 1 done, bit 17 = slot 1 failed; wait up to 1 s */
++	for (unsigned i = 0; i < 1000 && !(gpu_rd(JOB_INT_RAWSTAT) & ((1u << 1) | (1u << 17))); i++) {
++		delay(1000);
++	}
++	uint32_t raw = gpu_rd(JOB_INT_RAWSTAT);
++	bool done = (raw & (1u << 1)) != 0;
++	flush_dcache64((addr64_t)pa, BG_SIZE, TRUE);
++	uint32_t got = *(volatile uint32_t *)(mem + BG_TARGET);
++	printf("BLUEJAY GPU: job %s: JOB_INT_RAWSTAT 0x%x JS1_STATUS 0x%x head 0x%x, exception 0x%x, target 0x%08x (%s)\n",
++	    done ? "done" : ((raw & (1u << 17)) ? "FAILED" : "TIMEOUT"), raw,
++	    gpu_rd(JS_REG(1, JS_STATUS)), gpu_rd(JS_REG(1, JS_HEAD_LO)), job[0], got,
++	    got == BG_MAGIC ? "GPU WROTE IT" : "not written");
++	printf("BLUEJAY GPU: MMU int 0x%x AS0 fault 0x%x addr 0x%08x%08x, GPU fault 0x%x addr 0x%x\n",
++	    gpu_rd(MMU_INT_RAWSTAT), gpu_rd(AS_REG(0, AS_FAULTSTATUS)),
++	    gpu_rd(AS_REG(0, AS_FAULTADDRESS_HI)), gpu_rd(AS_REG(0, AS_FAULTADDRESS_LO)),
++	    gpu_rd(GPU_FAULT_STATUS), gpu_rd(GPU_FAULT_ADDRESS_LO));
++}
++
++static void
++bluejay_gpu_thread(void *arg, __unused wait_result_t wr)
++{
++	int level = (int)(uintptr_t)arg;
++
++	vm_offset_t pd = ml_io_map(PD_G3D_PA & ~0x3fffULL, 0x4000);
++	if (!pd) {
++		return;
++	}
++	volatile uint32_t *pdr = (volatile uint32_t *)(pd + (PD_G3D_PA & 0x3fff));
++	uint32_t cfg = pdr[0], st = pdr[1];
++	uint32_t cores = *(volatile uint32_t *)(pd + (G3D_PMU_STATUS_PA & 0x3fff));
++	printf("BLUEJAY GPU: PD_G3D config 0x%x status 0x%x, G3D cores status 0x%x\n", cfg, st, cores);
++	if (!(st & 1)) {
++		printf("BLUEJAY GPU: G3D power domain is off; GPU not touched\n");
++		return;
++	}
++	bg_regs = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!bg_regs) {
++		return;
++	}
++	uint32_t id = gpu_rd(GPU_ID);
++	if (id == 0 || id == 0xffffffffu) {
++		printf("BLUEJAY GPU: GPU_ID reads 0x%x; stopping\n", id);
++		return;
++	}
++	bg_features();
++	if (level < 2) {
++		return;
++	}
++	if (!bg_power() || level < 3) {
++		return;
++	}
++	bg_job_test();
++}
++
++void bluejay_gpu_start(void);
++
++void
++bluejay_gpu_start(void)
++{
++	int level = 0;
++	DTEntry bj;
++	uint32_t const *qemu;
++	unsigned qsz;
++
++	PE_parse_boot_argn("sweetgpu", &level, sizeof(level));
++	if (level <= 0 || SecureDTLookupEntry(NULL, "/bluejay", &bj) != kSuccess ||
++	    SecureDTGetProperty(bj, "qemu", (void const **)&qemu, &qsz) != kSuccess ||
++	    qsz != 4 || *qemu != 0) {
++		return;
++	}
++	thread_t th;
++	if (kernel_thread_start(bluejay_gpu_thread, (void *)(uintptr_t)level, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
 diff --git a/bsd/dev/bluejay_touch.c b/bsd/dev/bluejay_touch.c
 new file mode 100644
 index 0000000..d389e52
@@ -389,7 +768,7 @@ index 0000000..d389e52
 +	return 1;
 +}
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 53e5095..6d5def7 100644
+index 53e5095..1ac3c8a 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
 @@ -14,6 +14,14 @@
@@ -635,6 +1014,15 @@ index 53e5095..6d5def7 100644
  	}
  probed:
  	lck_mtx_unlock(&sweet_ufs_lock);
+@@ -707,6 +789,8 @@ probed:
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
+ 	sweet_sample_start();
++	extern void bluejay_gpu_start(void);
++	bluejay_gpu_start();             /* boot-arg sweetgpu=N: Mali-G78 self-test */
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
 index b6c1a41..99263d6 100644
 --- a/bsd/dev/sweet_usb.c
