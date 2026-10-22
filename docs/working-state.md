@@ -743,3 +743,22 @@ WRITE_VALUE job on JS1: JOB_INT_RAWSTAT 0x2, JS1_STATUS 0x0, target
 0xcafef00d (**GPU WROTE IT**); no MMU or GPU fault. The Mali-G78 runs jobs
 through its MMU. After the countdown the phone reset into fastboot. Next: rail enable in normal GPU bring-up, sweetgl rebuild
 with the no-GPU fallback, root rebuild (userdata flash needs Ray's OK).
+
+Rail in normal bring-up, level 4 (2026-10-22 16:38): commit f354839, CI
+kernel SHA256 `169125f144ad94dfd82afd26882039838480a75ddcfa01831c8806c63651cb20`,
+image out/phone-gpu-l4probe/boot.img SHA256
+`21b218025df554be359f2c9cf6dab377aa58db8848a7e27427dc7ae2e219f2d6`
+(`sweetgpu=4 sweetgpuprobe=1`, no sweetgpurail: on by default). Log
+out/gpu-l4-phone.log: BUCK2S on, L2/shader 0x779fff/tiler ok, WRITE_VALUE
+job 0xcafef00d (GPU WROTE IT), no faults, "user address space ready"
+(SweetGPU accepts clients). QEMU: GPU skipped, hold reached.
+sweetgl with the no-GPU fallback: CI 39836205136 (e8b975d), dylib SHA256
+`fc461d3f9e3d41abb66e705e89423ce50ca1d25a9420a8a055ab4fc1f4c5122c`.
+New root out/root-gpu2.img = root-gpu.img with only /usr/lib/sweetgl.dylib
+replaced (manifest entry 0 0 755 unchanged): raw SHA256
+`cc93bdee0d292793f9dfaadfa30ccca7529e3a3b9d10b4fc7ab881edaf7b9338`, sparse
+out/root-gpu2.simg SHA256
+`8ee2b25c0f757b1d65b2bc7e59c258bfcea7779e6c94e1ef52bffed5c17707ff`.
+GPU iOS boot image out/phone-gpu-ios/boot.img SHA256
+`5fd56514ab53cdba506b86e9e06f1e90acf99a1e2569e34ea2a86106198589c3`
+(Codex's renderer cmdline on the new kernel). Not flashed; needs Ray's OK.
