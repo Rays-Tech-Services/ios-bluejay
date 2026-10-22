@@ -2679,17 +2679,16 @@ index d8a7f5a..537f75b 100644
  AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
 diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
 new file mode 100644
-index 0000000..7d0dca9
+index 0000000..e69f4cb
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,376 @@
 +/* Pixel Mali-G78 IOKit bridge. ABI and synchronous buffer/submit design follow
 + * joranv1's ios-sailfish SweetGPU, reused with permission; Mali backend is new.
-+ * Experimental opt-in sweetgpu=4; root clients only. No service on QEMU.
++ * Experimental opt-in sweetgpu=4; administrator/backboardd clients only. No service on QEMU.
 + */
 +#include <pexpert/arm64/board_config.h>
 +#if defined(SWEET)
-+#include <device/device_types.h>
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOUserClient.h>
 +#include <IOKit/IOBufferMemoryDescriptor.h>
@@ -2770,7 +2769,11 @@ index 0000000..7d0dca9
 +SweetGPU::newUserClient(task_t task, void *security, UInt32 type,
 +    OSDictionary *props, IOUserClient **client)
 +{
-+	if (!client || type || IOUserClient::clientHasPrivilege(security, kIOClientPrivilegeAdministrator) != kIOReturnSuccess) {
++	OSObject *entitlement = IOUserClient::copyClientEntitlement(task, "com.apple.backboardd");
++	bool compositor = entitlement == kOSBooleanTrue;
++	OSSafeReleaseNULL(entitlement);
++	if (!client || type || (!compositor &&
++	    IOUserClient::clientHasPrivilege(security, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)) {
 +		return kIOReturnNotPrivileged;
 +	}
 +	*client = NULL;
@@ -2867,7 +2870,7 @@ index 0000000..7d0dca9
 +	b.prepared = true;
 +	for (uint32_t p = 0; p < b.count; p++) {
 +		IOByteCount length = 0;
-+		b.pages[p] = b.memory->getPhysicalSegment((IOByteCount)p * PAGE_SIZE, &length);
++		b.pages[p] = b.memory->getPhysicalSegment((IOByteCount)p * PAGE_SIZE, &length, kIOMemoryMapperNone);
 +		if (!b.pages[p] || (b.pages[p] & PAGE_MASK) || length < PAGE_SIZE) {
 +			ret = kIOReturnVMError;
 +			goto fail;
@@ -2954,7 +2957,7 @@ index 0000000..7d0dca9
 +	if (!jobFound) {
 +		return kIOReturnBadArgument;
 +	}
-+	/* A single address space is deliberately restricted to trusted root clients.
++	/* A single address space is deliberately restricted to administrators and the entitled compositor.
 +	 * GPU PTEs preserve read-only client mappings; NOEXEC forbids code fetch.
 +	 */
 +	for (uint32_t i = 0; i < request->handle_count; i++) {
@@ -3220,7 +3223,7 @@ index 0631685..87dac1c 100644
 +#include "SweetUSBNetwork.h"
  #endif /* SWEET */
 diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
-index 7f90c56..31b1539 100644
+index 7f90c56..df53abf 100644
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -39,6 +39,9 @@
@@ -3241,7 +3244,12 @@ index 7f90c56..31b1539 100644
  #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
  
  OSDefineMetaClassAndStructors(SweetSurface, OSObject);
-@@ -84,6 +88,9 @@ SweetSurface::free()
+@@ -80,10 +84,13 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ void
+ SweetSurface::free()
+ {
+-	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
++	if (clientMemory || OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
  		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
  	}
  	OSSafeReleaseNULL(kernelMap);
@@ -3381,7 +3389,7 @@ index 7f90c56..31b1539 100644
  	SweetSurfaceRef *ref = NULL;
  	bool existing = false;
  	IOReturn ret = addRef(s, &ref, &existing);
-@@ -684,7 +752,82 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+@@ -684,7 +752,94 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  	}
  	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
  	ret = sweet_surface_layout(s, props);
@@ -3439,6 +3447,15 @@ index 7f90c56..31b1539 100644
 +		uint64_t len = round_page_64(span);
 +		bool valid = s->planeCount == 0 && addr != 0 && span <= SWEET_SURFACE_MAX_ALLOC &&
 +		    len != 0 && len <= SWEET_SURFACE_MAX_ALLOC && start <= UINT64_MAX - len;
++		bool charged = false;
++		if (valid) {
++			charged = (uint64_t)OSAddAtomic64(len, (volatile SInt64 *)&sweet_surface_wired) +
++			    len <= SWEET_SURFACE_WIRED_MAX;
++			if (!charged) {
++				OSAddAtomic64(-(SInt64)len, (volatile SInt64 *)&sweet_surface_wired);
++				valid = false;
++			}
++		}
 +		IOMemoryDescriptor *md = valid ? IOMemoryDescriptor::withAddressRange(start,
 +		    len, kIODirectionInOut, fTask) : NULL;
 +		if (md != NULL && md->prepare() != kIOReturnSuccess) {
@@ -3450,6 +3467,9 @@ index 7f90c56..31b1539 100644
 +			s->readOnly = md != NULL;
 +		}
 +		if (md == NULL) {
++			if (charged) {
++				OSAddAtomic64(-(SInt64)len, (volatile SInt64 *)&sweet_surface_wired);
++			}
 +			ret = kIOReturnVMError;
 +		} else {
 +			s->memory = md;
@@ -3465,7 +3485,7 @@ index 7f90c56..31b1539 100644
  		IOBufferMemoryDescriptor *mem = NULL;
  		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
  		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
-@@ -727,6 +870,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -727,6 +882,11 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
      __unused void *reference)
  {
  	uint64_t arg0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
@@ -3477,7 +3497,7 @@ index 7f90c56..31b1539 100644
  
  	switch (selector) {
  	case kSweetSurfaceLimits: {
-@@ -767,11 +915,16 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+@@ -767,11 +927,16 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
  			return kIOReturnNotFound;
  		}
  		args->scalarOutput[0] = sweet_surface_port_in_task(s, fTask);
@@ -3494,7 +3514,7 @@ index 7f90c56..31b1539 100644
  	default:
  		/* Values, notifications, ownership, timestamps...: accept and ignore. */
  		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
-@@ -830,6 +983,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
+@@ -830,6 +995,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
  		return kIOReturnNotFound;
  	}
  	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
@@ -3502,7 +3522,7 @@ index 7f90c56..31b1539 100644
  	s->release();
  	return ret;
  }
-@@ -844,6 +998,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+@@ -844,6 +1010,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
  	}
  	IOReturn ret = sweet_surface_seed_out(s, seedOut,
  	    !((uintptr_t)options & kIOSurfaceLockReadOnly));

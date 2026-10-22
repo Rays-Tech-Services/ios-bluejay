@@ -193,13 +193,13 @@ This is build evidence, not phone rendering evidence.
 Ray requested the next phone boot attempt full acceleration. The opt-in
 `sweetgpu=4` draft runs power-up and WRITE_VALUE before enabling the SweetGPU
 user address space. The service exposes the shared ABI to administrator
-clients, limits wired memory to 512MiB, preserves read-only IOSurface pages,
+clients and the entitled backboardd compositor (which runs as mobile), limits wired memory to 512MiB, preserves read-only IOSurface pages,
 maps 16KiB host pages as 4KiB GPU PTEs, and adds a guard after each allocation.
 Submissions are serialized and synchronous (fragment JS0, other JS1). A fault
 disables submissions and attempts a bounded hard reset. If reset is unconfirmed,
 client teardown retains wired buffers instead of freeing possible DMA targets.
-The single GPU address space is experimental and restricted to trusted root
-clients; it does not provide per-client GPU isolation.
+The single GPU address space is experimental and restricted to administrators and the entitled
+compositor; it does not provide per-client GPU isolation.
 
 The draft also adapts ios-sailfish 0152/0157/0158 behavior: unsupported surface
 wrap selectors fail; client-address images retain their cache mode and exact
@@ -208,3 +208,17 @@ The backend host harness exercises exported code under ASan/UBSan with mocked
 MMIO: parameters, invalid pages, PTE permissions/subpages, guard/reuse, slots,
 timeouts, reset failure and quarantine. These tests cannot establish hardware
 correctness. Kernel CI/QEMU, deployment and physical rendering remain pending.
+
+CI `39734735027` compiled the driver but failed to link because importing
+`device/device_types.h` ahead of IOKit gave io_object_t the IPC-port type in
+the new user-client vtable. Match the existing IOSurface include order instead.
+The next build also includes backboardd entitlement access, raw physical
+segment queries, and client-image wired-budget accounting. Sanitized mock
+IOKit tests cover allocation/prepare/map failures, invalid/stale handles,
+submission bounds/routing, read-only imports, balanced cleanup and quarantine.
+
+The undeployed local root clone contains the signed library and 48 PNG layers,
+with dimensions checked against HEIC sources and fixer manifest entries added.
+`out/root-gpu.simg` expands to 17179869184 bytes with independently verified
+SHA256 `e8e91a93fb841ec1992916d28af35b878f2fb1a23f6e9f1179b59037bd723651`.
+Installing it requires Ray's new explicit approval to wipe userdata.
