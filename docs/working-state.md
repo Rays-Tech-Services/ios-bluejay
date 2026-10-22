@@ -241,3 +241,14 @@ errors, AMFI policy/copy errors). Source whitespace and exported patch
 reverse-application checks pass. Full IOSurface review and next gates are
 in docs/gpu-bringup.md. SweetGPU, Panfrost sweetgl and root deployment remain
 pending; the existing userdata-wipe prohibition remains in effect.
+
+Physical GPU update: direct-MMIO kernel fa085af, CI 39730945390, SHA256
+`3b223959da448a903f7aea70e4345d9495928f9a9b4197e0d623b27a571df50c`,
+passed QEMU smoke and real level-1 identification (GPU_ID 0x92020010, 20 shaders).
+Ray confirmed iOS lock/home screen. Level-2 temporary image SHA256
+`b1b5e576bb9a004fb8647a6e8a44414a0a0bd019ac2e49fbb0b35b15a5cd07fb`
+reset successfully; L2 and tiler powered on, shaders timed out at zero.
+Level 3 withheld. Manual core-stack fallback is queued for CI/QEMU/device
+validation; seven sanitized mocked power cases and 20 probe gate cases pass.
+No partitions flashed; GPU acceleration is not yet working. Details and
+log paths are in docs/gpu-bringup.md.

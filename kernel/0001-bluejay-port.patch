@@ -133,10 +133,10 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..59d37cf
+index 0000000..6b5812f
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
-@@ -0,0 +1,409 @@
+@@ -0,0 +1,437 @@
 +/*
 + * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
 + * sweetgpu=N, run once after the root mounts, everything logged:
@@ -210,9 +210,14 @@ index 0000000..59d37cf
 +#define GPU_COHERENCY_ENABLE    0x304
 +#define   COHERENCY_NONE                31
 +#define GPU_STACK_PRESENT_LO    0xe00
++#define STACK_READY_LO          0xe10
++#define STACK_PWRON_LO          0xe20
++#define SHADER_PWRTRANS_LO      0x200
++#define STACK_PWRTRANS_LO       0xe40
 +#define GPU_JM_CONFIG           0xf00
 +#define GPU_SHADER_CONFIG       0xf04
 +#define   SC_VAR_ALGORITHM              (1u << 29)      /* HW_ISSUE_TTRX_2968_TTRX_3162 */
++#define   JM_MANUAL_POWER_CONTROL       (1u << 8)
 +#define   JM_IDVS_GROUP_SIZE_SHIFT      16
 +#define   JM_DEFAULT_IDVS_GROUP_SIZE    0xf
 +
@@ -354,6 +359,29 @@ index 0000000..59d37cf
 +	gpu_wr(SHADER_PWRON_LO, sh);
 +	gpu_wr(SHADER_PWRON_HI, shhi);
 +	bool ok_sh = gpu_poll(SHADER_READY_LO, 0xffffffffu, sh, 20);
++	if (!ok_sh && ok_l2) {
++		/* Google's kbase corestack_driver_control sequence: select manual
++		 * power control, power all present stacks, then request shaders.
++		 * Keep this fallback bounded and diagnostic-only, after automatic
++		 * shader power-up has demonstrably failed on this boot.
++		 */
++		uint32_t stacks = gpu_rd(GPU_STACK_PRESENT_LO);
++		printf("BLUEJAY GPU: shader timeout; JM 0x%x stack ready 0x%x trans 0x%x shader trans 0x%x\n",
++		    gpu_rd(GPU_JM_CONFIG), gpu_rd(STACK_READY_LO),
++		    gpu_rd(STACK_PWRTRANS_LO), gpu_rd(SHADER_PWRTRANS_LO));
++		if (stacks && stacks != 0xffffffffu) {
++			gpu_wr(GPU_JM_CONFIG, gpu_rd(GPU_JM_CONFIG) | JM_MANUAL_POWER_CONTROL);
++			gpu_wr(STACK_PWRON_LO, stacks);
++			bool ok_stack = gpu_poll(STACK_READY_LO, 0xffffffffu, stacks, 20);
++			printf("BLUEJAY GPU: manual stack power %s (0x%x)\n",
++			    ok_stack ? "ok" : "TIMEOUT", gpu_rd(STACK_READY_LO));
++			if (ok_stack) {
++				gpu_wr(SHADER_PWRON_LO, sh);
++				gpu_wr(SHADER_PWRON_HI, shhi);
++				ok_sh = gpu_poll(SHADER_READY_LO, 0xffffffffu, sh, 20);
++			}
++		}
++	}
 +	gpu_wr(TILER_PWRON_LO, ti);
 +	bool ok_ti = gpu_poll(TILER_READY_LO, 0xffffffffu, ti, 20);
 +	printf("BLUEJAY GPU: power on L2 %s (0x%x) shader %s (0x%x) tiler %s (0x%x)\n",

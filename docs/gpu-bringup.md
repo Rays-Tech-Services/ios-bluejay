@@ -78,7 +78,9 @@ The probe did run; the firmware status-read path was wrong. Linux's
 [Tensor PMU implementation](https://github.com/torvalds/linux/blob/master/drivers/soc/samsung/exynos-pmu.c)
 uses MMIO reads because the SMC interface reads only writable registers.
 Commit `fa085af` restores direct PMU reads with per-read checkpoints while
-retaining replay and the domain-on guard. CI run `39730945390` is in progress.
+retaining replay and the domain-on guard. CI run `39730945390` passed.
+Kernel SHA256 is `3b223959da448a903f7aea70e4345d9495928f9a9b4197e0d623b27a571df50c`;
+all QEMU smoke checks passed (`out/smoke-gpu-mmio/`).
 `python3 tools/gpu-probe-test.py` passes 20 ASan/UBSan cases for the actual
 probe control flow, including board/QEMU guards, power-off/invalid status,
 mapping/start failures, levels and delay bounds. Hardware operations are mocked.
@@ -152,3 +154,31 @@ CI compilation, QEMU and later device injection remain separate evidence.
 These review findings have not been applied as additional IOSurface changes.
 SweetGPU and physical Panfrost/sweetgl validation are still pending. Root deployment requires a
 new explicit userdata-wipe approval, as specified in the handoff.
+
+## Direct-MMIO phone results
+
+The level-1 temporary image `out/phone-gpu1-mmio/boot.img`
+(SHA256 `fbfccf861e7c291a24e1f9ae776eef7165f611c861e04fbf4793a379850dda23`)
+passed the physical identification test. PD_G3D configuration/status and core
+status each read 1. GPU_ID is `0x92020010`; shader-present mask `0x779fff`
+contains 20 cores, AS-present is `0xff`, and JS-present is `0x7`. L2/shader/tiler
+ready masks were zero before the power-up test. Evidence is retained in
+`out/gpu1-mmio-phone.log` and `out/gpu1-mmio-result.json`. Ray confirmed the
+iOS lock/home screen. Identification does not establish accelerated rendering.
+
+After recording notice, the same smoke-tested kernel was temporarily booted
+with `sweetgpu=2`; image SHA256
+`b1b5e576bb9a004fb8647a6e8a44414a0a0bd019ac2e49fbb0b35b15a5cd07fb`.
+Fastboot send/boot returned OKAY. USB Ethernet re-enumerated and the log confirms
+level 2 started. Reset completed, L2 and tiler powered on, but shaders timed
+out with ready mask zero. Evidence: `out/gpu2-mmio-phone.log` and
+`out/gpu2-mmio-result.json`. Level 3 was withheld. No partition was flashed.
+
+The next diagnostic adds a bounded manual core-stack fallback after automatic
+shader power-up fails, following Google kbase corestack_driver_control:
+JM_CONFIG bit 8, power all present stacks, wait, then retry shaders. This is
+an unverified hardware hypothesis. Seven sanitized host cases test normal
+automatic operation, manual retry, stack timeout, failed L2, invalid/absent
+stacks and failed resets; hardware is mocked. Source: Google GPU module
+commit `20fff721667a227b3d6decf9dbc3798476390302`,
+`mali_kbase/backend/gpu/mali_kbase_pm_driver.c`.
