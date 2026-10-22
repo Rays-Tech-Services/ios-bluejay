@@ -1325,6 +1325,7 @@ static void prepare_ufs(u64 dtb, int test)
 #include "log-viewer.h"
 #include "mark-success.h"
 #include "power-usb.h"
+#include "gpu-query.h"
 
 static void __attribute__((noreturn)) diag(u64 dtb)
 {
@@ -1338,6 +1339,8 @@ static void __attribute__((noreturn)) diag(u64 dtb)
 		diag_slots(dtb);
 	if (chosen_prop(dtb, "bootargs", &v, &len) && contains((const char *)v, len, "shimlog"))
 		diag_log(dtb);
+	if (chosen_prop(dtb, "bootargs", &v, &len) && contains((const char *)v, len, "shimgpuq"))
+		diag_gpu_query(dtb);
 	say(C_OK, "DIAGNOSTIC BOOT (docs/bringup.md)");
 	kv2("PSCI ", smc(0x84000000, 0, 0, 0), " SMCCC ", smc(0x80000000, 0, 0, 0));
 	if (chosen_prop(dtb, "bootargs", &v, &len)) {

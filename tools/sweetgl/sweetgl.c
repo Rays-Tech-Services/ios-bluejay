@@ -62,6 +62,7 @@ struct sweetgl_ctx {
 
 static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct pipe_frontend_screen *fscreen;
+static bool init_failed;  /* tried once: CoreAnimation asks every frame */
 static driOptionCache opt_info, opts;
 
 void
@@ -90,7 +91,7 @@ bool
 sweetgl_init(void)
 {
 	pthread_mutex_lock(&init_lock);
-	if (fscreen == NULL) {
+	if (fscreen == NULL && !init_failed) {
 		int fd = sweet_drm_open();
 		if (fd >= 0) {
 			/* G78 transaction elimination is not reliable on the reference port. */
@@ -112,6 +113,7 @@ sweetgl_init(void)
 		}
 	}
 	bool ok = fscreen != NULL;
+	init_failed = !ok;
 	pthread_mutex_unlock(&init_lock);
 	return ok;
 }
@@ -269,12 +271,8 @@ static void *
 selftest_thread(void *arg)
 {
 	(void)arg;
-	/* the GPU service comes up during boot: retry for 2 minutes */
-	for (int i = 0; i < 120 && !sweetgl_init(); i++) {
-		sleep(1);
-	}
 	if (!sweetgl_init()) {
-		sweet_drm_log("sweetgl: selftest: no GPU after 2 minutes");
+		sweet_drm_log("sweetgl: selftest: no Panfrost screen");
 		return NULL;
 	}
 	sweetgl_selftest();
@@ -295,6 +293,17 @@ sweetgl_load(void)
 		}
 		return;
 	}
+	/*
+	 * Decide once: without a started GPU leave EAGLContext alone, so
+	 * CoreAnimation draws with its software renderer exactly as without
+	 * this library (the newUserClient wait covers a self-test still running).
+	 */
+	int fd = sweet_drm_open();
+	if (fd < 0) {
+		sweet_drm_log("sweetgl: no GPU (SweetGPU unavailable): CoreAnimation keeps its software renderer");
+		return;
+	}
+	close(fd);
 	sweetgl_eagl_install();
 	const char *t = getenv("SWEETGL_TEST");
 	if (t && t[0] == '1') {

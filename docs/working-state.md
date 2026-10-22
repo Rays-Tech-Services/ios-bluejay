@@ -177,6 +177,394 @@ Added sweetusblogip bootarg to select192.168.2.1 (0xc0a80201) for shared
 subnet and retained unsent log cursor until a route becomes ready.
 Next kernel CI needed. No HTTP internet success established yet.
 
+User initially said Ethernet adapter Settings crashed, then clarified the page
+eventually loaded. Do NOT classify as a proven Settings crash; may be slow.
+It shows Configure IP Automatic, IP/subnet/router all blank. Thus previous
+manual settings instructions were not applied, and DHCP has no lease.
+Leave Automatic for the pending BPF fix build (commit4e33bb7). User still
+has no confirmed web page load; "WAIT IT LOADED" referred to Settings.
+
+BPF fix CI39540681694 (4e33bb7) succeeded; downloaded out/ci-usb-bpf.
+Kernel SHA25638e71a7d98bcfe091b19caa4d083921239fb8eb047b31de35d6efffd486e40ab.
+Packed out/phone-ios-usb-bpf/boot.img, 8 CPUs, sweetusb=2 sweetbattery=2
+and sweetusblogip=0xc0a80201 (host sharing IP192.168.2.1). User returned
+fastboot; advance notice given, temporary fastboot boot returnedOKAY.
+UDP capture session77153 writes out/usb-bpf-live.log for5min. Awaiting
+DHCP address, ping, and actual phone HTTP GET. Installed boot untouched.
+
+BPF fix hardware success: phone now obtains192.168.2.2 automatically,
+responds to ping (~1.7–2.7ms), sends >180KB of live logs from2.2 to2.1.
+DHCP/address issue resolved. Native Ethernet visible; leave Automatic.
+Need user retry fixed test http://192.168.2.1:8080/plain and then external
+http://neverssl.com. No phone HTTP request yet seen in localserver log.
+MobileSafari exec observed in new live log; no proven page rendering fault.
+Do not call internet complete until real page received/displayed.
+
+## WebKit rendering investigation (2026-10-21)
+
+User now explicitly requests graphics/WebKit diagnosis. USB local HTTP transport
+is verified: `out/pixel-web-test.log` records phone 192.168.2.2 GET /plain
+HTTP 200 twice. The user sees a white content area, including after disabling
+GPU Process: DOM Rendering and GPU Process: Canvas Rendering and restarting
+Safari. Do not treat the white page as proof of failed networking. External
+Internet access is separate and remains unverified by these local requests.
+
+Earlier kernel log shows WebContent, Networking and GPU process launches; GPU
+created IOSurface id 28, 1125x1536, format b3a8, two planes. Apple SDK defines
+b3a8 as uncompressed RGB10 wide-range color plus a separate alpha8 plane.
+Framebuffer currently copies every four-byte pixel as BGRA, including w30r
+surfaces observed from SpringBoard. That is a concrete format-handling gap,
+but is not yet established as the cause of blank WebKit content: WebKit's
+surface may be composed into another surface before framebuffer presentation.
+Do not claim a framebuffer conversion alone fixes WebKit.
+
+Fresh UDP capture started at `out/webkit-render-live.log`, port 5140; asked
+user to force-close/reopen Safari and load the local plain page during capture.
+No new kernel or boot/partition changes made for this investigation yet.
+
+WebKit test prepared in commit e52d455, CI run 39544599771. See
+`docs/webkit-rendering.md`. Experimental `sweetweb_bgra=1` substitutes a fully
+described BGRA allocation for parentless WebKit RGB10 surfaces before painting;
+other processes unchanged. Plane-0 default BPE for b3a8 corrected to four.
+Sanitized host geometry/process-selection checks pass. Hardware rendering
+result still pending. User asked for fastboot readiness asynchronously; announce
+immediately before any temporary boot. Never flash userdata for this test.
+
+WebKit CI 39544599771 succeeded. Kernel SHA256
+`ded7c2a36b247f409c015abeaa45aaf5bce120f42bd0c9e9cfe5de1d1e014ca9`.
+Temporary image `out/phone-ios-webkit-bgra/boot.img`, SHA256
+`4cb4e020b769a70ca54094c56efe208d00a2d91e684f64454f6f2d1108c7ee1d`.
+Exact prior phone ADT, RAM and boot OS metadata retained; old command line plus
+`sweetweb_bgra=1` verified. Structured state: out/webkit-bgra-test-state.json.
+QEMU smoke running under snapshot with the same kernel; phone not booted yet.
+
+WebKit kernel QEMU smoke passed: display driver started, SmokeRoot mounted,
+launchd exec reached after 31 seconds. Expected errno 2 panic: the empty smoke
+root has no launchd. This does not exercise WebKit itself. Temporary phone boot
+and visible webpage rendering are still pending fastboot readiness.
+
+Temporary WebKit BGRA image booted via fastboot successfully. User reports
+"its black"; asked whether only webpage or entire display. Do not mark fixed.
+Phone log out/webkit-bgra-phone.log confirms GPU process requests b3a8/w30r
+normalized to BGRA with the intended geometry; subsequent local /plain GET
+requests return 200. No WebKit crash observed in captured log. Full phone
+screen state still needs user clarification. Installed boot unchanged.
+
+User clarified BGRA test: only Safari webpage is black, controls remain
+visible. WebKit rendering remains broken. User explored Linux/Mali backend,
+then chose to continue software-rendering work first (WebKit, wallpaper/blur,
+performance). No GPU driver or Linux boot has been attempted.
+
+Commit bbc2dbc adds opt-in sweetweb_trace=1: bounded WebKit surface sampling
+and map/export/lock/unlock events. No rendering/synchronization behavior changed.
+CI 39548618591 in progress. Sanitized probe and format tests pass. Fastboot
+readiness requested asynchronously; announce before any boot. Existing image
+with BGRA policy alone remains out/phone-ios-webkit-bgra/boot.img.
+
+User confirms phone is in fastboot and explicitly authorizes automatic
+temporary boot once ready; no need to ask before temporary boots again.
+Current diagnostic build still compiling. Preserve installed boot/userdata.
+
+Read-only follow-up research: matching WebKit source defines
+AcceleratedDrawingEnabled in WebPreferencesDebug.yaml, WebKit default true.
+WebPreferencesCocoa.mm reads debug overrides from standardUserDefaults using
+its globalDebugKeyPrefix. This is a candidate for explicit unaccelerated
+bitmap drawing; no preference injection, binary patch, or root change has
+been implemented. GPU process toggles alone are not equivalent to this flag.
+Downloaded matching YAMLs in out/graphics-research/. Await trace evidence
+before choosing another behavior change.
+
+WebKit trace CI 39548618591 succeeded; kernel SHA256
+354ab380d4efbc91811b56d47fcb2086d46574d02b0812fde0d8e78c72853324.
+Image out/phone-ios-webkit-trace/boot.img SHA256
+610f20e812a799083ca4eb29ce8b1fcc72285728fc9f9e21eb5f2fcc4271ea33.
+QEMU display/root/launchd boot smoke passed in 31 seconds. Temporary fastboot
+boot returned OKAY. Same phone ADT and old args plus sweetweb_trace=1 retained
+and verified (including sweetweb_bgra=1). Capture out/webkit-trace-phone.log,
+UDP5140 listener session44987 lasts15min. Requested user open /plain in Safari
+and leave15seconds to collect buffer samples. Rendering result pending.
+
+Trace result (fresh-eyes review 2026-10-21): every WebKit GPU-process surface
+(13 ids) stayed all-zero for 30 polls after its single GPU lock/unlock; backboardd
+mapped and read them. Tiles are never painted; compositor handoff works. WebKit
+draws via CGIOSurfaceContext -> QuartzCore AccelRenderer (Metal fails -> SWContext).
+Commit 4a91c55 adds opt-in `sweetweb_cpu=1`: refuse IOSurfaces for the WebKit
+GPU/WebContent processes so WebKit's verified fallback uses CPU CGBitmapContext
+buffers. Host format/probe tests pass. CI 39550812835. Packing recipe verified
+byte-identical for the trace image: mkpayload KERNEL out/bluejay-wake.adt +
+cmdline, mkbootimg shim/out/shim.o --like backup/stock/boot.img.
+WebKit FIXED with sweetweb_cpu=1 (temporary boot out/phone-ios-webkit-cpu/boot.img,
+SHA256 129acec5...4129): user confirms Safari draws the local test page. See
+docs/webkit-rendering.md. Installed boot_a NOT updated; needs a decision to flash.
+
+## Thermal governor and wallpaper flags (2026-10-21)
+
+Source changes exported into `kernel/0001-bluejay-port.patch` and synchronized
+with the local XNU checkout and `kernel/include/BluejayThermal.h`:
+
+- Failed battery reads request the hot clock level instead of indefinitely
+  retaining full-speed clocks with a stale temperature.
+- Apply policy on the first sample; retry both clock domains after a partial
+  ACPM failure, including when temperature returns to the previous level.
+- Preserve both A76 and X1 boot-time clock ceilings.
+- Check ACPM channel bounds before reading descriptors, require aligned queue
+  data and valid ring indices, and order response reads before consuming them.
+
+`tools/package-thermal-wallpaper.py` packages an explicitly supplied rebuilt
+kernel using a previous phone boot image's ADT and flags. It replaces duplicate
+or disabled options with `sweetbattery=2 sweetthermal=1 sweetfix_posterboard=1`,
+checks the command-line limit, copies stock boot metadata with `--like`, and
+records input and output SHA256 hashes. It requires a new output directory.
+The existing PosterBoard workaround is specific to iOS 16.7.16 (20H392), checks
+the expected instruction, and may skip a different build. Wallpaper recovery
+is not yet verified.
+
+After CI builds the updated patch, package with:
+
+```sh
+python3 tools/package-thermal-wallpaper.py \
+  out/ci-thermal-wallpaper/kernel.development.sweet \
+  out/phone-perf-7-x2/boot.img out/phone-thermal-wallpaper \
+  --shim shim/out/shim.o --like backup/stock/boot.img
+```
+
+Validation: thermal and battery host checks compiled with warnings as errors
+and ASan/UBSan passed; three flag packaging tests passed; reverse patch check
+against local XNU and source whitespace check passed. The latest phone image's
+updated argument line is 424 bytes (607 usable); saved for review in
+`out/thermal-wallpaper-cmdline.txt`. No updated kernel or boot image was built:
+full Xcode is unavailable locally, so CI build and QEMU smoke remain pending.
+No phone boot, flash, or userdata change was performed. Phone clock transitions
+and wallpaper behavior remain unverified. Give advance notice before a future
+temporary boot so the user can record it.
+
+### Thermal + PosterBoard temporary boot (2026-10-21)
+
+CI initially exposed a pre-existing stray `void` before the ACPM helper
+functions. Removed it in commit `a0d2023` (governor recovery / packaging changes
+are in `fdb7a7f`). Corrected CI run 39562526847 succeeded:
+https://github.com/Rays-Tech-Services/ios-bluejay/actions/runs/39562526847
+
+- Kernel: `out/ci-thermal-wallpaper/kernel.development.sweet`, SHA256
+  `addfd6471a782d591fa8fffbcbe633c90710c0d9a9e49399202b132e2d3d974a`.
+- Image: `out/phone-thermal-wallpaper/boot.img`, SHA256
+  `6d76d19b33bc8b0d3f3c816a8154f9759449d34c69b5bf9555ba688acadbb668`.
+- Eight CPUs, `shimcpu=1`, `sweetbattery=2 sweetthermal=1
+  sweetfix_posterboard=1`; previous phone ADT and remaining flags preserved.
+- Input/output hashes and full flags: image directory `manifest.json`.
+  Stock boot metadata copied using `--like backup/stock/boot.img` and checked.
+- QEMU smoke passed diagnostics, EL2/EL1 transition, initrd handoff,
+  framebuffer driver, virtio disk, userdata discovery, HFS root mounting,
+  and launchd exec (empty smoke root). QEMU does not validate physical
+  thermal hardware or wallpaper behavior.
+- After advance recording notice, `fastboot boot` returned OKAY for send
+  and boot (0.433 s total). No installed boot partition or userdata flashed.
+  Phone UI, wallpaper recovery, and live thermal transitions await observation.
+
+USB detection and QEMU local sockets required execution outside the sandbox;
+empty sandboxed fastboot output did not mean the connected phone was absent.
+
+## Display tearing: enable existing TE synchronization (2026-10-21)
+
+User reports substantial tearing on the thermal + PosterBoard temporary image.
+Its manifest confirms that `sweetfb_te` was absent, so the existing TE hold
+path was disabled while `sweetfb_hz=60` copied into live scanout memory.
+Local GS101 reference `research/display/samsung/cal_9845/regs-decon.h` and
+`decon_reg.c` confirm GLOBAL_CON idle bit 5 and TRIG_CON mask bit 4 used by
+the implementation. Enabling the path masks the panel trigger around the
+entire multi-layer copy, waits for DECON idle, then orders framebuffer writes
+before releasing the trigger. Actual hardware effectiveness is unverified.
+The existing path counts a 20 ms idle timeout and still copies; logs must be
+checked for timeouts before calling this a reliable tearing fix.
+
+Updated `tools/package-thermal-wallpaper.py` to force `sweetfb_te=1` alongside
+the governor and PosterBoard options, including replacement of disabled or
+duplicate TE arguments. All three packaging tests pass. Prepared
+`out/phone-thermal-wallpaper-te/boot.img`, SHA256
+`6e04ec7c7778a02fbab1edad7675d7ef7428d12dd9613fea561bba34b70967ad`.
+Verified byte-for-byte identical kernel payload and ADT to the previous
+thermal + PosterBoard image, apart from the command-line field. Kernel CI and
+QEMU evidence above therefore applies to the same kernel. No new kernel build
+was necessary. Boot and visual verification await fastboot readiness.
+
+TE image temporary boot: after user fastboot readiness and recording notice,
+verified the manifest SHA256 and `sweetfb_te=1`, detected the expected Pixel,
+and ran `fastboot boot out/phone-thermal-wallpaper-te/boot.img`. Sending and
+booting both returned OKAY (0.440 s total). No partitions flashed. Awaiting
+user observation of scrolling/animation tearing; hardware effectiveness and
+TE idle timeout counters remain unverified.
+
+## Restore native resolution (2026-10-21)
+
+User requested reverting the earlier smaller rendering resolution. Updated
+packaging to remove `sweetfb_lw=828 sweetfb_lh=1792` (including any other
+explicit logical-size overrides) and force `sweetfb_native=1`. This selects
+the panel's native 1080x2400 geometry instead of the smaller scaled output
+or the default iPhone logical dimensions. Thermal, PosterBoard and TE flags
+remain enabled. Packaging tests pass, including disabled-native and smaller
+size override removal. Kernel and ADT bytes are unchanged.
+
+Prepared `out/phone-native-te/boot.img`, SHA256
+`20c5a6b105c3d33da9cae51d85678d8ab351f8e0ac374f4abea0f52274b21523`.
+No phone boot or flash yet; fastboot currently detects no device. Awaiting
+user fastboot readiness for temporary boot. Installed boot is unchanged.
+
+Native-resolution temporary boot: user confirmed fastboot readiness. After
+recording notice, verified image SHA256, `sweetfb_native=1`, retained TE flag,
+and absence of logical-size overrides. Expected Pixel detected; temporary
+`fastboot boot out/phone-native-te/boot.img` returned OKAY for send and boot
+(0.408 s total). No partitions flashed. Native-resolution UI behavior and
+tearing improvement still require phone observation.
+
+## USB Ethernet reconnection check (2026-10-21)
+
+User requested enabling USB Ethernet on the native-resolution boot. The image
+already includes `sweetusb=2`. Read-only checks outside the sandbox after the
+user reconnected the cable still found no Pixel CDC-ECM interface and no Pixel
+in the Mac IOUSB device tree. Saved Sweet iOS network service is enabled, but
+has no current Ethernet address. Internet Sharing preferences retain NAT=1
+and destination en5, but com.apple.NetworkSharing is not running and bridge100
+is absent. These saved settings do not prove an active USB or internet link.
+No Mac network configuration changed. Requested fastboot readiness for a fresh
+temporary boot with the cable attached to reinitialize USB; current cause of
+missing USB enumeration is unverified.
+
+## Battery read recovery prepared (2026-10-21)
+
+User reports inaccurate battery again and has returned the phone to fastboot.
+Prepared source changes: retry complete read transactions up to three times;
+separate charger-status validity from fuel-gauge validity so a charger read
+failure cannot freeze valid SOC/voltage/temperature; preserve last known
+charging flags until charger reads recover; remove the synthetic 100% startup
+capacity; mark failed gauge samples stale/invalid and expose failure count.
+Charging controls and gauge calibration are not changed. This fixes identified
+software reporting defects, but the cause on this particular boot is unverified.
+
+Sanitized battery host checks cover advancing SOC during charger failure,
+preserved charge state, recovery/unplug, and rejection of invalid gauge data.
+Those checks, packaging tests, source whitespace, and reverse patch check pass.
+Shared decoder copies synchronized. Review diff: `out/battery-recovery-review.patch`.
+Native-resolution packaging and TE settings are retained.
+
+Commit/push to main for the required CI build was rejected by automatic
+approval review: externally visible repository changes were not explicitly
+authorized. No commit or push executed for these changes. Full Xcode is not
+available locally. Need explicit authorization before committing/pushing and
+building; do not boot the older image as if it contains this fix.
+
+### Battery recovery kernel booted and USB restored
+
+User explicitly approved committing/pushing the prepared changes. Commit
+`79ba99f` CI run 39675029858 succeeded:
+https://github.com/Rays-Tech-Services/ios-bluejay/actions/runs/39675029858
+Kernel SHA256 `7541c41bf023893968796f0db475aea4ca0ae4b48e29b05fa0f5d886b3a05ad4`.
+Image `out/phone-battery-recovery/boot.img`, SHA256
+`7b51fcb7d4df6da156a9da88a3911b4b0dd16f95fa4ddf42cd9c031d519337f5`.
+Host checks and all QEMU smoke checks passed through HFS mount and launchd exec.
+Recording notice given; fastboot send/boot returned OKAY (0.447 s). No flash.
+
+Fresh boot enumerated USB Ethernet en5. Saved Mac Internet Sharing started
+without changing its configuration: bridge100 192.168.2.1/24, member en5,
+phone MAC learned. Received 568 UDP log packets from the phone, saved in
+`out/battery-recovery-phone.log`. This verifies bidirectional device/host link
+activity, but external internet access has not been newly tested.
+
+Phone log confirms `MAX77759 reported SOC, 100% 4302mV external=1 charging=1`,
+thermal sensor 22C and ACPM clock requests succeeding. No failed-sample messages
+in this captured boot. This is a measured gauge report, not the removed startup
+placeholder; gauge calibration/long-term accuracy is not verified. Phone UI
+percentage, charging transitions and external networking await user observation.
+Native display 1080x2400 and TE hold on are confirmed in the hardware log.
+
+USB reachability verified: 3/3 ping replies from 192.168.2.2, zero loss,
+average 1.371 ms. This is local-link evidence, not an external internet test.
+
+## Reported UI boot failure after battery recovery
+
+User reports that iOS does not finish booting. Prior fastboot OKAY, DHCP,
+USB logs and ping evidence established a running kernel/userspace network,
+not a usable lock screen. Do not call that a completed UI boot.
+Additional live log `out/boot-failure-live.log` continues to receive data;
+framebuffer statistics show zero presented frames, with backboardd repeatedly
+looking for AppleM2ScalerCSCDriver. No kernel panic observed. PosterBoard
+crashed in the earlier capture. Cause remains unverified.
+
+Prepared one-variable display-mode recovery test:
+`out/phone-boot-recovery/boot.img`, SHA256
+`71888a18cca338961e0aee0f61594630dc02926d26aa3b58f2dd0d6a6358ae4e`.
+Only `sweetfb_native=1` changed to 0; kernel and ADT bytes match the battery
+recovery image. Original full-resolution 1125x2436 logical mode maps onto the
+1080x2400 panel; the earlier reduced 828x1792 overrides remain absent. Battery,
+USB, thermal, PosterBoard and TE options retained. This tests the hypothesis
+that forcing true panel dimensions breaks the iOS compositor's display-mode
+assumptions. Awaiting fastboot readiness; no recovery boot or flash performed.
+
+## Stock apps root (2026-10-21)
+
+Cause of "missing apps": the 32 removable stock apps (Calculator, Weather,
+Notes, Maps, Mail, Music, Clock, Calendar, ...) ship in
+`/private/var/staged_system_apps`; only DataMigration's SystemAppMigrator
+installs them, and sweet-root-tweaks.py skips DataMigration. Wallpaper files
+are identical to the IPSW (234 files); black wallpaper is the rendering issue.
+
+`tools/install-staged-apps.py` moved them into `/Applications` (root:wheel,
+original modes) in a clone of `out/root-aligned.img` -> `out/root-apps.img`
+(raw SHA256 `f59bc576031fac7a2ddddfe67d95b6ff011c1e03b84f78817ff26e34451d22db`),
+sparse `out/root-apps.simg` (SHA256 `4b5e319e672dfa514895cb76011271b5099330a36ec768cc4f9e3adcfdcad173`).
+Manifest still 321301 entries (9416 rewritten).
+
+QEMU (battery-recovery kernel, 1 CPU): fixer 321301 entries, 0 errors; lock
+screen reached ~32 min after boot (first-boot LaunchServices rebuild blocks
+SpringBoard in `_LSCopyServerStore` for ~20 min). IconState.plist lists the new
+apps and widgets. Home screen not visually checked (no QEMU touch).
+Phone not flashed yet: flashing wipes the user's current iOS data.
+
+User authorized wipe. 19:34-19:40 flashed `out/root-apps.simg` to userdata
+(90/90 chunks OKAY, 360 s), then temporary-booted `out/phone-fix/boot.img`
+(OKAY). Fixer result on the phone screen awaited; boot_a not touched.
+
+USB Ethernet on the new root (temporary boots only, boot_a unchanged =
+pre-USB 8-core image, which is why normal power-on has no USB). 21:34 booted
+`phone-ios-webkit-cpu` (129acec5): en5 + sharing up, phone answered only
+192.168.7.2; configd ignored en0. 21:39 booted `out/phone-usb-log71/boot.img`
+(same image, one byte: sweetusblogip=0xc0a80701 so logs reach 7.1 before DHCP;
+SHA256 8d565352...). First boot after the wipe: addNetworkInterface runs, configd
+picks en0 up only minutes later (same as the original usb-network boot).
+21:46 user sees Ethernet in Settings; 192.168.2.2 replies 3/3 (~2.7 ms).
+Log: out/usb-apps-live.log. External internet not yet verified.
+External internet VERIFIED (IMG_5953): Safari loads https://en.wikipedia.org
+over USB Ethernet + Mac Internet Sharing, with text and images rendered.
+
+## Shutdown panic fix (2026-10-21)
+
+iOS Shut Down panicked "Halt/Restart Timed Out" (default halt only parks the
+CPU; PEHaltRestart's 30 s timer fires). Commit 9c14b70: bluejay power off =
+PSCI SYSTEM_OFF (falls back to SYSTEM_RESET), restart = SYSTEM_RESET;
+sweetreboot=1 unchanged. CI 39709118621 success, kernel SHA256
+`0365ffa3428e7191b6a64e67b746c69f13dad56cede20b36c4532bc57a75f301` (out/ci-shutdown).
+QEMU: fixer RB_HALT logs "power off -> PSCI SYSTEM_OFF" and the VM powers off,
+no panic. Phone image `out/phone-ios-shutdown/boot.img` (SHA256 addd6993...e367):
+webkit-cpu image's exact shim, ADT and cmdline (old payload reproduced byte-exact;
+boot_v4 reproduced byte-exact), only the kernel payload replaced.
+Phone behaviour (power off vs charger screen with cable) not yet verified.
+
+PSCI SYSTEM_OFF did not power off the phone (still "Halt/Restart Timed Out";
+Pixel EL3 parks the CPU). Commit 4c25079: power off clears PMU PS_HOLD_CONTROL
+(0x17460000+0x3e9c) bit 0x100 via SMC 0x82000504 like Google's pixel-reboot
+(research/gs101/dts/gs101.dtsi), then after 3 s resets into the bootloader;
+restart = PSCI SYSTEM_RESET then SWRESET (+0x3a00 bit 0x2). CI 39710710573,
+kernel SHA256 a96e3e545235bf10a3029b10a347263ff759f465f6979533a141e6725c7aff8f.
+QEMU: PMU read unsupported -> fallback reset, no panic.
+
+INSTALLED: `out/phone-ios-pshold/boot.img` (SHA256 b92a5d89...c04b; webkit-cpu
+image + this kernel; USB, battery, sweetweb_cpu) flashed to boot_a 22:28 at
+user request. Flash cleared slot-successful:a; shimmarka (out/phone-mark-success)
+re-set it: fastboot shows successful yes, unbootable no, retry 3. Previous
+installed image backup: backup/known-working-ios-8core-2026-10-20/boot.img.
+Normal reboot issued 22:3x. Phone shutdown behaviour not yet verified.
+Shut Down VERIFIED on the phone (user, 22:4x): installed PS_HOLD kernel powers
+the phone off; no "Halt/Restart Timed Out" panic.
+
 
 ## GPU handoff execution (2026-10-22)
 
@@ -272,3 +660,43 @@ Ray requested the next normal iOS boot attempt full acceleration. Do not
 perform another diagnostic-only phone boot. Userdata installation requires
 new explicit wipe approval and one maintenance fixer boot before the normal
 renderer-enabled boot. No partition has been flashed; boot_a remains unchanged.
+
+GPU-enabled install (2026-10-22, physical phone): Ray approved the userdata
+wipe. out/root-gpu.simg (sparse SHA256 `ea36cc0b…8b17`) flashed with
+`fastboot -S 128M`, 91/91 chunks OKAY, 365 s (out/gpu-userdata-flash.log).
+Fixer boot out/phone-fix/boot.img (SHA256 `0bf55cf0…841a`) returned to
+fastboot after ~7.5 min. Temporary boot of out/phone-gpu-renderer/boot.img
+(`0e7f3d07…6ad1`); boot_a unchanged. First UDP log ~5 min after boot
+(out/gpu-renderer-phone.log). Result: PD_G3D on, GPU_ID 0x92020010, reset ok,
+L2 and tiler powered, **manual stack power TIMEOUT and shader TIMEOUT**
+(JM 0xf0000, stack ready 0x0, trans 0x7f, shader trans 0x779fff).
+SweetGPU open from backboardd returns 0xe00002d8 (not ready); sweetgl
+falls back to Apple's EAGL ("no Mesa context"), and its texture fixes were
+not installed ("unexpected QuartzCore"). SpringBoard exec'd. GPU acceleration
+is still not working; next step is the shader-core power path (core stacks
+transition but never report ready).
+Follow-up: the phone stayed on the Apple logo. iOS was up (touch events,
+daemons running) but nothing was drawn after the boot frame: sweetgl retried
+the SweetGPU open 43 times and every EAGL context fell back to Apple's EAGL,
+which cannot work without Apple's GPU driver, so SpringBoard never got a
+display. sweetgl must fall back to CPU rendering (not Apple's EAGL) when
+SweetGPU is unavailable. Ray: no further iOS boots until the GPU works.
+Root cause of the frozen display: every EAGLContext init reopened SweetGPU,
+and newUserClient waits up to 5 s for a self-test that had already failed,
+so backboardd's render loop blocked on every frame. Fix (uncommitted, not yet
+built in CI): sweet_drm_open treats a failed open as final, sweetgl_init
+treats a failed Panfrost screen as final, and backboardd's load hook skips
+the EAGL shim entirely when SweetGPU cannot be opened (same approach as
+HackiOS inject.c opengl_es()/my_renderer). Host test tools/sweetgl/drm-test.c
+covers the single-open rule and passes with ASan/UBSan. The shader-core power
+failure is unchanged; this only stops a dead GPU from freezing the UI.
+
+GPU clock query prepared (2026-10-22): shim/gpu-query.h adds `shimgpuq`, a
+read-only diagnostic screen: PD_G3D / PD_EMBEDDED_G3D config+status and ACPM
+DVFS FREQ_GET for domains 0-13 (mainline gs101 order; G3D=5, G3DL2=6 to be
+confirmed by plausible kHz). No writes. Image out/phone-gpu-query/boot.img
+SHA256 `a6ee63f62407e183e153ce33cd730431ddc499b58dc3da1092d4159eaf9bd49b`
+(stock metadata via --like). QEMU (out/q-gpu-query): screen renders, every
+query returns error 1 (no ACPM firmware), shim halts. Phone run pending.
+Hypothesis under test (unverified): the shader clock domain G3D is stopped,
+which would explain L2/tiler ready but shader power-on timing out.

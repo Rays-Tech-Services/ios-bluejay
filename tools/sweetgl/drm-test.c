@@ -1,12 +1,31 @@
 /* Host-only IOKit mocks: exercises the actual DRM translator, not the GPU. */
 #define IOConnectCallScalarMethod test_scalar
 #define IOConnectCallStructMethod test_struct
+#define IOServiceGetMatchingService test_matching
+#define IOServiceOpen test_open
 #include "sweet_drm.c"
 #include <assert.h>
 
 static uint32_t mock_handle = 1;
-static uint32_t scalar_calls, submit_calls;
+static uint32_t scalar_calls, submit_calls, open_calls;
 static bool fail_submit, fail_free;
+
+io_service_t
+test_matching(mach_port_t port, CFDictionaryRef matching)
+{
+	(void)port;
+	CFRelease(matching);
+	open_calls++;
+	return 0;  /* no SweetGPU: the GPU did not start */
+}
+
+kern_return_t
+test_open(io_service_t service, task_port_t task, uint32_t type, io_connect_t *out)
+{
+	(void)service; (void)task; (void)type; (void)out;
+	assert(!"opened without a service");
+	return kIOReturnError;
+}
 
 kern_return_t
 test_scalar(mach_port_t c, uint32_t selector, const uint64_t *in,
@@ -123,5 +142,11 @@ main(void)
 	assert(drmCloseBufferHandle(-1, 2) == 0);
 	connection = 0;
 	assert(drmIoctl(-1, DRM_IOCTL_PANFROST_GET_PARAM, &param) == -ENODEV);
+
+	/* a failed open is final: no second (5 s) newUserClient wait per frame */
+	errno = 0;
+	assert(sweet_drm_open() == -1 && errno == ENODEV && open_calls == 1);
+	assert(sweet_drm_open() == -1 && errno == ENODEV && open_calls == 1);
+	assert(drmOpenWithType("panfrost", NULL, DRM_NODE_RENDER) == -1 && open_calls == 1);
 	return 0;
 }

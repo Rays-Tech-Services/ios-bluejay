@@ -30,6 +30,7 @@ struct sweet_bo {
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static io_connect_t connection;
+static bool unavailable;  /* the one open failed: the GPU did not start this boot */
 static int device_fd = -1;
 static struct sweet_bo bos[SWEET_GPU_MAX_HANDLES];
 static uint32_t next_sync = 1;
@@ -61,11 +62,16 @@ scalar(uint32_t selector, const uint64_t *in, uint32_t nin, uint64_t *out, uint3
 	return 0;
 }
 
+/*
+ * SweetGPU's newUserClient waits up to 5 s for the hardware self-test, and
+ * CoreAnimation asks for a context every frame, so a failed open is final:
+ * retrying would block backboardd's render loop for the rest of the boot.
+ */
 int
 sweet_drm_open(void)
 {
 	pthread_mutex_lock(&lock);
-	if (!connection) {
+	if (!connection && !unavailable) {
 		io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("SweetGPU"));
 		if (service) {
 			kern_return_t kr = IOServiceOpen(service, mach_task_self(), 0, &connection);
@@ -86,6 +92,7 @@ sweet_drm_open(void)
 				}
 			}
 		}
+		unavailable = !connection;
 	}
 	int fd = connection && device_fd >= 0 ? dup(device_fd) : -1;
 	pthread_mutex_unlock(&lock);
