@@ -133,7 +133,7 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..94a4766
+index 0000000..fd62303
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
 @@ -0,0 +1,727 @@
@@ -730,8 +730,8 @@ index 0000000..94a4766
 +		int e = bg_pmic_read(sel[i].speedy, sel[i].reg, &v);
 +		printf("BLUEJAY GPU PROBE: %s 0x%02x (err %d)\n", sel[i].name, v, e);
 +	}
-+	int rail = 0;
-+	if (PE_parse_boot_argn("sweetgpurail", &rail, sizeof(rail)) && rail == 1) {
++	int rail_on = 0;
++	if (PE_parse_boot_argn("sweetgpurail", &rail_on, sizeof(rail_on)) && rail_on == 1) {
 +		bg_rail_on();
 +	}
 +}
