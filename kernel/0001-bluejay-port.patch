@@ -1069,7 +1069,7 @@ index 53e5095..1ac3c8a 100644
  	sweet_keys_init();
  	sweet_touch_init();
 diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
-index b6c1a41..99263d6 100644
+index b6c1a41..cd8961f 100644
 --- a/bsd/dev/sweet_usb.c
 +++ b/bsd/dev/sweet_usb.c
 @@ -21,6 +21,7 @@
@@ -1303,7 +1303,29 @@ index b6c1a41..99263d6 100644
  			printf("SWEET USB: disconnect\n");
  		}
  		return;
-@@ -823,7 +904,9 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -806,6 +887,9 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+  * 192.168.7.1:5140 (on the PC: nc -ukl 5140). Starts with the last 64 KiB
+  * so the boot is included. Nothing here may print (it would feed itself).
+  * Boot-arg sweetusblog=0 disables it.
++ * sweetusblogreplay=1..6 retries the retained boot log at ten-second
++ * intervals. UDP sends can succeed before the host has configured its
++ * interface, so successful sends alone do not establish boot-log delivery.
+  */
+ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ extern uint64_t sweet_log_position(void);
+@@ -817,13 +901,20 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 	socket_t so = NULL;
+ 	struct sockaddr_in to;
+ 	uint64_t pos = sweet_log_position();
++	uint32_t replays = 0, replay_ticks = 0;
+ 
+-	pos = pos > 65536 ? pos - 65536 : 0;
++	PE_parse_boot_argn("sweetusblogreplay", &replays, sizeof(replays));
++	if (replays > 6) {
++		replays = 0;
++	}
++	pos = replays ? 0 : (pos > 65536 ? pos - 65536 : 0);
+ 	bzero(&to, sizeof(to));
  	to.sin_len = sizeof(to);
  	to.sin_family = AF_INET;
  	to.sin_port = htons(5140);
@@ -1314,15 +1336,22 @@ index b6c1a41..99263d6 100644
  	for (;;) {
  		ud_sleep_ms(100);
  		if (!ud.configured) {
-@@ -834,6 +917,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -833,7 +924,14 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			so = NULL;
  			continue;
  		}
++		if (replays != 0 && ++replay_ticks >= 100) {
++			/* sweet_log_copy clamps to the retained ring if it has wrapped. */
++			pos = 0;
++			replay_ticks = 0;
++			replays--;
++		}
  		uint32_t n;
 +		uint64_t before = pos;
  		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
  			struct iovec iov = { .iov_base = chunk, .iov_len = n };
  			struct msghdr msg = {
-@@ -842,8 +926,10 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -842,8 +940,10 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
  			};
  			size_t sent = 0;
  			if (sock_send(so, &msg, 0, &sent) != 0) {
@@ -1334,7 +1363,7 @@ index b6c1a41..99263d6 100644
  		}
  	}
  }
-@@ -854,6 +940,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -854,6 +954,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	thread_t thread;
  
  	ud.dwc = dwc;
@@ -1343,7 +1372,7 @@ index b6c1a41..99263d6 100644
  	if (kmem_alloc_contig(kernel_map, &ud.dma, UD_SIZE, PAGE_MASK, 0, 0,
  	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
  		printf("SWEET USB: no DMA memory\n");
-@@ -884,6 +972,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -884,6 +986,12 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
  	ud.evt_pos = 0;
  
@@ -1356,7 +1385,7 @@ index b6c1a41..99263d6 100644
  	/* High speed, address 0 */
  	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
  	dwc_wr(DCFG, dcfg | 0);
-@@ -902,7 +996,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+@@ -902,7 +1010,9 @@ sweet_usb_gadget_start(vm_offset_t dwc)
  	dwc_wr(DALEPENA, 0x3);
  	ud_start_setup();
  
