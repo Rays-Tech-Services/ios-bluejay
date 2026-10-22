@@ -133,10 +133,10 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..236963b
+index 0000000..d7a7632
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
-@@ -0,0 +1,372 @@
+@@ -0,0 +1,384 @@
 +/*
 + * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
 + * sweetgpu=N, run once after the root mounts, everything logged:
@@ -153,6 +153,8 @@ index 0000000..236963b
 + * rails and G3D clock left on by the bootloader), Linux panfrost_regs.h /
 + * panfrost_gpu.c / panfrost_mmu.c / panfrost_job.c and Mesa genxml v9.xml.
 + * Interrupts stay masked: everything is polled.
++ * sweetgpu_delay=0..300 delays the probe in seconds so USB logging can
++ * become reachable before the one-shot diagnostic runs (default: no delay).
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -456,6 +458,16 @@ index 0000000..236963b
 +bluejay_gpu_thread(void *arg, __unused wait_result_t wr)
 +{
 +	int level = (int)(uintptr_t)arg;
++	int seconds = 0;
++	PE_parse_boot_argn("sweetgpu_delay", &seconds, sizeof(seconds));
++	if (seconds < 0 || seconds > 300) {
++		seconds = 0;
++	}
++	if (seconds != 0) {
++		assert_wait_timeout((event_t)&bg_regs, THREAD_UNINT,
++		    (uint32_t)seconds * 1000, NSEC_PER_MSEC);
++		thread_block(THREAD_CONTINUE_NULL);
++	}
 +
 +	vm_offset_t pd = ml_io_map(PD_G3D_PA & ~0x3fffULL, 0x4000);
 +	if (!pd) {
