@@ -133,10 +133,10 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..d7a7632
+index 0000000..1730678
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
-@@ -0,0 +1,384 @@
+@@ -0,0 +1,385 @@
 +/*
 + * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
 + * sweetgpu=N, run once after the root mounts, everything logged:
@@ -159,6 +159,7 @@ index 0000000..d7a7632
 +#include <sys/param.h>
 +#include <sys/systm.h>
 +#include <kern/clock.h>
++#include <kern/sched_prim.h>
 +#include <kern/thread.h>
 +#include <machine/machine_routines.h>
 +#include <arm/caches_internal.h>
