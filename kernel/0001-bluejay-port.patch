@@ -1690,7 +1690,7 @@ index d8a7f5a..f43e4f9 100644
  void
  AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
 diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
-index 0631685..f61bbec 100644
+index 0631685..87dac1c 100644
 --- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
 +++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
 @@ -9,6 +9,7 @@
@@ -1709,20 +1709,29 @@ index 0631685..f61bbec 100644
  };
  
  OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
-@@ -34,6 +36,67 @@ SweetPlatformExpert::start(IOService *provider)
+@@ -34,6 +36,94 @@ SweetPlatformExpert::start(IOService *provider)
  	return true;
  }
  
 +#if defined(SWEET_BOARD_BLUEJAY)
 +/*
 + * Mainline gs101.dtsi / gs101-pmu.c: the PMU only accepts writes through
-+ * EL3 (SMC 0x82000504: address, 1 = write, value). SYSIP_DAT0 holds the
-+ * reboot mode ABL reads: 0xfc = bootloader (fastboot).
++ * EL3 (SMC 0x82000504: address, 0 = read / 1 = write, value). SYSIP_DAT0
++ * holds the reboot mode ABL reads: 0xfc = bootloader (fastboot).
++ * Google gs101.dtsi pixel-reboot: power off clears PS_HOLD_CONTROL bit 0x100,
++ * software reset sets SWRESET_SYSTEM bit 0x2. The Pixel EL3 does not power
++ * off on PSCI SYSTEM_OFF (it parks the CPU), so it is not used.
 + */
-+#define BLUEJAY_PMU_SYSIP_DAT0          (0x17460000ULL + 0x810)
++#define BLUEJAY_PMU_BASE                0x17460000ULL
++#define BLUEJAY_PMU_SYSIP_DAT0          (BLUEJAY_PMU_BASE + 0x810)
++#define BLUEJAY_PMU_PS_HOLD_CONTROL     (BLUEJAY_PMU_BASE + 0x3e9c)
++#define BLUEJAY_PS_HOLD_DATA            0x100
++#define BLUEJAY_PMU_SWRESET_SYSTEM      (BLUEJAY_PMU_BASE + 0x3a00)
++#define BLUEJAY_SWRESET_TRIGGER         0x2
 +#define BLUEJAY_REBOOT_BOOTLOADER       0xfc
 +#define TENSOR_SMC_PMU_SEC_REG          0x82000504ULL
-+#define PSCI_SYSTEM_OFF                 0x84000008ULL
++#define TENSOR_PMUREG_READ              0
++#define TENSOR_PMUREG_WRITE             1
 +#define PSCI_SYSTEM_RESET               0x84000009ULL
 +
 +static uint64_t
@@ -1742,11 +1751,24 @@ index 0631685..f61bbec 100644
 +/*
 + * sweetreboot=1 (bluejay test images): iOS restart and power off both reset
 + * into the bootloader, so the next `fastboot boot` needs no button combo.
-+ * Otherwise power off is PSCI SYSTEM_OFF and restart is PSCI SYSTEM_RESET.
-+ * The default path only parks the CPU, so PEHaltRestart's 30 s timer
-+ * panicked "Halt/Restart Timed Out"; if SYSTEM_OFF returns, reset instead.
++ * Otherwise power off drops PS_HOLD like Pixel's own pixel-reboot driver and
++ * restart is PSCI SYSTEM_RESET, then SWRESET. The default path only parks
++ * the CPU, so PEHaltRestart's 30 s timer panicked "Halt/Restart Timed Out";
++ * if the phone is still running (e.g. USB power holds it up), reset into the
++ * bootloader instead of panicking.
 + * Panics keep the default path (their text stays on the screen).
 + */
++#if defined(SWEET_BOARD_BLUEJAY)
++static void
++bluejay_reset_to_bootloader(void)
++{
++	uint64_t r = bluejay_smc(TENSOR_SMC_PMU_SEC_REG, BLUEJAY_PMU_SYSIP_DAT0,
++	    TENSOR_PMUREG_WRITE, BLUEJAY_REBOOT_BOOTLOADER);
++	bluejay_smc(PSCI_SYSTEM_RESET, 0, 0, 0);
++	IOLog("SWEET: PSCI SYSTEM_RESET returned (mode write %llx)\n", r);
++}
++#endif
++
 +int
 +SweetPlatformExpert::haltRestart(unsigned int type)
 +{
@@ -1756,19 +1778,24 @@ index 0631685..f61bbec 100644
 +	    PE_parse_boot_argn("sweetreboot", &mode, sizeof(mode)) && mode == 1) {
 +		IOLog("SWEET: %s -> reset into the bootloader\n",
 +		    type == kPEHaltCPU ? "power off" : "restart");
-+		uint64_t r = bluejay_smc(TENSOR_SMC_PMU_SEC_REG, BLUEJAY_PMU_SYSIP_DAT0, 1,
-+		    BLUEJAY_REBOOT_BOOTLOADER);
-+		bluejay_smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-+		IOLog("SWEET: PSCI SYSTEM_RESET returned (mode write %llx)\n", r);
++		bluejay_reset_to_bootloader();
 +	} else if (type == kPEHaltCPU) {
-+		IOLog("SWEET: power off -> PSCI SYSTEM_OFF\n");
-+		uint64_t r = bluejay_smc(PSCI_SYSTEM_OFF, 0, 0, 0);
-+		IOLog("SWEET: PSCI SYSTEM_OFF returned %llx, resetting\n", r);
-+		bluejay_smc(PSCI_SYSTEM_RESET, 0, 0, 0);
++		uint64_t hold = bluejay_smc(TENSOR_SMC_PMU_SEC_REG, BLUEJAY_PMU_PS_HOLD_CONTROL,
++		    TENSOR_PMUREG_READ, 0);
++		IOLog("SWEET: power off, PS_HOLD_CONTROL %llx\n", hold);
++		if (hold <= 0xffffffffULL && (hold & BLUEJAY_PS_HOLD_DATA)) {
++			bluejay_smc(TENSOR_SMC_PMU_SEC_REG, BLUEJAY_PMU_PS_HOLD_CONTROL,
++			    TENSOR_PMUREG_WRITE, hold & ~(uint64_t)BLUEJAY_PS_HOLD_DATA);
++			IODelay(3 * 1000 * 1000);
++		}
++		IOLog("SWEET: still powered, resetting into the bootloader\n");
++		bluejay_reset_to_bootloader();
 +	} else if (type == kPERestartCPU) {
 +		IOLog("SWEET: restart -> PSCI SYSTEM_RESET\n");
 +		bluejay_smc(PSCI_SYSTEM_RESET, 0, 0, 0);
-+		IOLog("SWEET: PSCI SYSTEM_RESET returned\n");
++		bluejay_smc(TENSOR_SMC_PMU_SEC_REG, BLUEJAY_PMU_SWRESET_SYSTEM,
++		    TENSOR_PMUREG_WRITE, BLUEJAY_SWRESET_TRIGGER);
++		IOLog("SWEET: restart did not reset\n");
 +	}
 +#endif
 +	return IODTPlatformExpert::haltRestart(type);
@@ -1777,7 +1804,7 @@ index 0631685..f61bbec 100644
  const char *
  SweetPlatformExpert::deleteList(void)
  {
-@@ -79,4 +142,5 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
+@@ -79,4 +169,5 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
   * "compatible" string and "model" (D22AP / iPhone10,3 in the ADT), which
   * is what the iPhone userland (MobileGestalt) expects.
   */
