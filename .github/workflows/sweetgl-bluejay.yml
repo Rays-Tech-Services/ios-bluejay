@@ -1,0 +1,51 @@
+name: sweetgl-bluejay
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "tools/sweetgl/**"
+      - "kernel/include/SweetGPUABI.h"
+      - ".github/workflows/sweetgl-bluejay.yml"
+
+concurrency:
+  group: sweetgl-bluejay-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          brew install meson ninja bison flex pkgconf llvm spirv-tools spirv-llvm-translator
+          python3 -m venv out/build-venv
+          out/build-venv/bin/pip install mako pyyaml packaging jinja2
+          echo "$PWD/out/build-venv/bin" >> "$GITHUB_PATH"
+      - name: Fetch pinned Mesa
+        run: |
+          git init research/mesa
+          git -C research/mesa fetch --depth 1 https://gitlab.freedesktop.org/mesa/mesa.git "$(cat tools/sweetgl/mesa-revision)"
+          git -C research/mesa checkout FETCH_HEAD
+      - name: Host DRM translator checks
+        run: |
+          clang -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -Itools/sweetgl/include -Itools/sweetgl -Ikernel/include -Iresearch/mesa/include \
+            tools/sweetgl/drm-test.c -framework IOKit -framework CoreFoundation -o out/drm-test
+          out/drm-test
+      - name: Configure shader tools and iOS Mesa
+        run: bash tools/sweetgl/mesa-setup.sh
+      - name: Build and sign sweetgl
+        run: bash tools/sweetgl/build.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweetgl-bluejay
+          path: |
+            out/sweetgl/
+            out/mesa-host/meson-logs/
+            out/mesa-ios/meson-logs/
+          if-no-files-found: warn

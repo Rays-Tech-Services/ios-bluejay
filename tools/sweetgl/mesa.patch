@@ -1,0 +1,62 @@
+diff --git a/meson.build b/meson.build
+index 96f8770..b79238e 100644
+--- a/meson.build
++++ b/meson.build
+@@ -811,6 +811,9 @@ if system_has_kms_drm
+       'amdgpu' : _libdrm_checks['amdgpu']['enabled'].to_string('enabled', 'disabled'),
+     },
+   )
++elif host_machine.system() == 'darwin' and with_gallium_panfrost
++  # sweetgl supplies the libdrm ABI over IOKit in the final iOS dylib.
++  dep_libdrm = declare_dependency()
+ else
+   # We should prevent libdrm from being available when the target doesn't have it to avoid transitive
+   # dependencies (such as vk-runtime) linking to it
+diff --git a/src/gallium/drivers/panfrost/pan_bo.c b/src/gallium/drivers/panfrost/pan_bo.c
+index 995224a..653c88a 100644
+--- a/src/gallium/drivers/panfrost/pan_bo.c
++++ b/src/gallium/drivers/panfrost/pan_bo.c
+@@ -330,10 +330,12 @@ panfrost_bo_munmap(struct panfrost_bo *bo)
+    if (!bo->ptr.cpu)
+       return;
+ 
++#ifndef __APPLE__
+    if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {
+       mesa_loge("munmap failed: %s", strerror(errno));
+       abort();
+    }
++#endif
+ 
+    bo->ptr.cpu = NULL;
+ }
+diff --git a/src/panfrost/lib/kmod/panfrost_kmod.c b/src/panfrost/lib/kmod/panfrost_kmod.c
+index 9b7010d..c028bb6 100644
+--- a/src/panfrost/lib/kmod/panfrost_kmod.c
++++ b/src/panfrost/lib/kmod/panfrost_kmod.c
+@@ -25,6 +25,13 @@
+ 
+ #include "pan_props.h"
+ 
++#ifdef __APPLE__
++/* sweetgl maps wired IOKit BOs; the fake DRM fd is not mmap-able. */
++void *sweet_drm_bo_map(int fd, uint64_t offset);
++#undef os_mmap
++#define os_mmap(addr, length, prot, flags, fd, offset) sweet_drm_bo_map(fd, offset)
++#endif
++
+ /* Maximum kmod BO label length, including NUL-terminator */
+ #define PANFROST_BO_LABEL_MAXLEN 4096
+ 
+diff --git a/src/panfrost/model/pan_model.c b/src/panfrost/model/pan_model.c
+index d9bdd28..8424177 100644
+--- a/src/panfrost/model/pan_model.c
++++ b/src/panfrost/model/pan_model.c
+@@ -90,6 +90,8 @@ const struct pan_model pan_model_list[] = {
+                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(9, 0, 3), 0, "G57",    "G77", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
+                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
++   VALHALL_MODEL(PAN_PROD_ID(9, 2, 2), 0, "G78",    "G78", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
++                                              MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(9, 2, 4), 0, "G68",    "G78", MODEL_ANISO(ALL),  MODEL_TB_SIZES(16384,  8192),
+                                               MODEL_RATES_X(2, 4, 8,  32,  32, 8)),
+    VALHALL_MODEL(PAN_PROD_ID(10, 8, 7), 0, "G610",   "G710", MODEL_ANISO(ALL),  MODEL_TB_SIZES(32768, 16384),
