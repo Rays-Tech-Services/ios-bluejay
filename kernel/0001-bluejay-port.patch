@@ -133,10 +133,10 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..59a23fb
+index 0000000..59d37cf
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
-@@ -0,0 +1,417 @@
+@@ -0,0 +1,409 @@
 +/*
 + * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
 + * sweetgpu=N, run once after the root mounts, everything logged:
@@ -175,7 +175,6 @@ index 0000000..59a23fb
 +#define G3D_PMU_STATUS_PA       0x17462004ULL   /* gpu_pmu_status_reg_offset */
 +#define GPU_PA                  0x1c500000ULL
 +#define GPU_SIZE                0x8000
-+#define TENSOR_SMC_PMU_SEC_REG   0x82000504ULL
 +
 +#define GPU_ID                  0x000
 +#define GPU_L2_FEATURES         0x004
@@ -280,20 +279,6 @@ index 0000000..59a23fb
 +#define BG_MAGIC                0xcafef00dU
 +
 +static vm_offset_t bg_regs;
-+
-+/* Same firmware PMU read ABI used by bluejay's verified PS_HOLD path. */
-+static uint64_t
-+bg_pmu_read(uint64_t address)
-+{
-+	register uint64_t x0 __asm__("x0") = TENSOR_SMC_PMU_SEC_REG;
-+	register uint64_t x1 __asm__("x1") = address;
-+	register uint64_t x2 __asm__("x2") = 0; /* read */
-+	register uint64_t x3 __asm__("x3") = 0;
-+	__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
-+	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
-+	    "x14", "x15", "x16", "x17", "memory");
-+	return x0;
-+}
 +
 +static uint32_t
 +gpu_rd(uint32_t off)
@@ -486,16 +471,23 @@ index 0000000..59a23fb
 +		thread_block(THREAD_CONTINUE_NULL);
 +	}
 +
-+	printf("BLUEJAY GPU: starting level %d; reading PMU through firmware\n", level);
-+	uint64_t cfg = bg_pmu_read(PD_G3D_PA);
-+	printf("BLUEJAY GPU: PD_G3D config SMC 0x%llx\n", cfg);
-+	uint64_t st = bg_pmu_read(PD_G3D_PA + 4);
-+	printf("BLUEJAY GPU: PD_G3D status SMC 0x%llx\n", st);
-+	uint64_t cores = bg_pmu_read(G3D_PMU_STATUS_PA);
-+	printf("BLUEJAY GPU: G3D cores status SMC 0x%llx\n", cores);
-+	if (cfg > UINT32_MAX || st > UINT32_MAX || cores > UINT32_MAX ||
-+	    cfg == UINT32_MAX || st == UINT32_MAX || cores == UINT32_MAX) {
-+		printf("BLUEJAY GPU: firmware PMU read failed; GPU not touched\n");
++	/* Linux tensor_sec_reg_read uses MMIO: SMC reads reject read-only
++	 * status registers with -EINVAL even though their MMIO reads are allowed. */
++	printf("BLUEJAY GPU: starting level %d; reading PMU by MMIO\n", level);
++	vm_offset_t pd = ml_io_map(PD_G3D_PA & ~0x3fffULL, 0x4000);
++	if (!pd) {
++		printf("BLUEJAY GPU: failed to map PMU; GPU not touched\n");
++		return;
++	}
++	volatile uint32_t *pdr = (volatile uint32_t *)(pd + (PD_G3D_PA & 0x3fff));
++	uint32_t cfg = pdr[0];
++	printf("BLUEJAY GPU: PD_G3D config MMIO 0x%x\n", cfg);
++	uint32_t st = pdr[1];
++	printf("BLUEJAY GPU: PD_G3D status MMIO 0x%x\n", st);
++	uint32_t cores = *(volatile uint32_t *)(pd + (G3D_PMU_STATUS_PA & 0x3fff));
++	printf("BLUEJAY GPU: G3D cores status MMIO 0x%x\n", cores);
++	if (cfg == UINT32_MAX || st == UINT32_MAX || cores == UINT32_MAX) {
++		printf("BLUEJAY GPU: invalid PMU response; GPU not touched\n");
 +		return;
 +	}
 +	if (!(st & 1)) {
