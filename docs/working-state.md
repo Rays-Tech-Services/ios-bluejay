@@ -252,3 +252,23 @@ Level 3 withheld. Manual core-stack fallback is queued for CI/QEMU/device
 validation; seven sanitized mocked power cases and 20 probe gate cases pass.
 No partitions flashed; GPU acceleration is not yet working. Details and
 log paths are in docs/gpu-bringup.md.
+
+Renderer-enabled candidate ready (not deployed): kernel e9cd287 / CI 39735597187
+build passed, SHA256 `f5e584200ebbd728d656138d21b78cf2c08041b5edc543a6773b63b1b7b49918`.
+All QEMU smoke checks passed, including level-4 emulated-board guard.
+Panfrost library d89bff4 / CI 39736044323 built/signed, SHA256
+`4b5f1cc84a2c93a31850dfbd04f5b70f769f9d0ee4a39cb84963f613c67e9947`.
+Phone image out/phone-gpu-renderer/boot.img SHA256
+`0e7f3d075af9eaaa86868c67c1b3c5cf90330285bfc977298d4f820bece56ad1`
+requests sweetgpu=4, backboardd injection and triangle self-test; proven shim
+and stock metadata preserved. Final root-gpu.simg expands to 16GiB, verified
+raw SHA256 `fa741e1159d86cceb6e703d422c0265bbb3fe8c406814cc287274df7c66ffebb`,
+sparse SHA256 `ea36cc0bda17514af444da256ad8c30ad3030c3703f58f204d55792c3c768b17`.
+Root includes the dylib and 48 checked PNG wallpaper layers. Full deployment
+manifest is out/gpu-deployment.json. Host checks include 23 probe gates,
+7 power cases, VM/job permissions and fault quarantine, and mocked IOKit
+buffer lifecycle/submission cases. Physical rendering remains unverified.
+Ray requested the next normal iOS boot attempt full acceleration. Do not
+perform another diagnostic-only phone boot. Userdata installation requires
+new explicit wipe approval and one maintenance fixer boot before the normal
+renderer-enabled boot. No partition has been flashed; boot_a remains unchanged.

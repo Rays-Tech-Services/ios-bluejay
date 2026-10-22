@@ -222,3 +222,39 @@ with dimensions checked against HEIC sources and fixer manifest entries added.
 `out/root-gpu.simg` expands to 17179869184 bytes with independently verified
 SHA256 `e8e91a93fb841ec1992916d28af35b878f2fb1a23f6e9f1179b59037bd723651`.
 Installing it requires Ray's new explicit approval to wipe userdata.
+
+## Full-acceleration install candidate
+
+All QEMU smoke checks passed (`out/smoke-gpu-renderer/`): shim EL transition,
+initrd payload discovery, framebuffer, virtio userdata, HFS+ mount and launchd
+exec attempt. The level-4 GPU path explicitly skipped the emulated board
+before MMIO. The empty smoke root's subsequent ENOENT panic is expected.
+
+- Kernel commit `e9cd287`, CI `39735597187`: build passed; SHA256
+  `f5e584200ebbd728d656138d21b78cf2c08041b5edc543a6773b63b1b7b49918`.
+- Renderer commit `d89bff4`, CI `39736044323`: build/signature passed; SHA256
+  `4b5f1cc84a2c93a31850dfbd04f5b70f769f9d0ee4a39cb84963f613c67e9947`.
+  The imported CPU map now starts at the page base; the resource carries
+  the intra-page pixel offset. A host case covers this.
+- `out/phone-gpu-renderer/boot.img`, SHA256
+  `0e7f3d075af9eaaa86868c67c1b3c5cf90330285bfc977298d4f820bece56ad1`,
+  retains the proven shim/ADT/stock metadata and reproduces the old image
+  byte-for-byte before replacing the kernel. It requests `sweetgpu=4`,
+  signed-library injection into backboardd, triangle self-test and UDP replay.
+- Final `out/root-gpu.simg` expands to 16GiB with independently verified SHA256
+  `fa741e1159d86cceb6e703d422c0265bbb3fe8c406814cc287274df7c66ffebb`.
+  This supersedes the intermediate v5-library image above. It includes the
+  final dylib, 48 dimension-verified PNG layers and fixer ownership entries.
+- `out/gpu-deployment.json` records complete hashes and inputs. The original
+  root image, installed boot_a and phone userdata remain unchanged.
+
+The reused QuartzCore shader-function patches have version guards. An offline
+check of this root's dyld cache found the reference table sentinel differs,
+so those optional shader-function fixes should skip; their visual effects
+remain unverified. Trace-only address hooks are disabled. This candidate
+attempts CoreAnimation GPU rendering but does not establish a usable compositor
+until physical GPU writes, triangle pixels and lock/home interaction are seen.
+
+Deployment is awaiting explicit userdata-wipe approval. It requires one
+maintenance fixer boot to apply ownership, then the temporary renderer-enabled
+iOS boot. Give recording notice before each. No boot_a flash is proposed.

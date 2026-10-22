@@ -20,7 +20,7 @@ commit `b2eee90baf71345690466df19a9a99425f95971d`. `mesa.patch` adds that entry,
 iOS BO mapping lifetime handling and the libdrm shim dependency.
 `mesa-setup.sh` builds native shader tools and configures the iOS cross-build;
 `build.sh` links and ad-hoc signs the library. The `sweetgl-bluejay` CI job
-exercises the full build. CI run `39733290573` produced the signed library, SHA256
-`30e27db78df22be92be79ef77b64c6e049d862db3094b77e145c70aa0d6cfc25`.
+exercises the full build. CI run `39736044323` produced the signed library, SHA256
+`4b5f1cc84a2c93a31850dfbd04f5b70f769f9d0ee4a39cb84963f613c67e9947`.
 Device deployment and rendering remain pending. See
 [GPU bring-up evidence](../../docs/gpu-bringup.md).

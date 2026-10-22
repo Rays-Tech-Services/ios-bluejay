@@ -74,13 +74,9 @@ int main(void) {
     bad=1ULL<<40;assert(!bluejay_gpu_map(&bad,1,false,false));
     uint64_t a=bluejay_gpu_map(pages,2,true,true);assert(a==BV_BASE);
     assert(bv_used[0]&&bv_used[1]&&bv_used[2]&&!bv_used[3]);
-    for(unsigned i=0;i<8;i++) assert(bv_l3[0][i]==(pages[i/4]+(i%4)*4096)|0); /* check below masks */
-    return 0;
-}
-'''
-# PTE address and permissions must preserve every 4KB subpage of a 16KB host page.
-main=main.replace('assert(bv_l3[0][i]==(pages[i/4]+(i%4)*4096)|0); /* check below masks */', 'assert((bv_l3[0][i] & 0x000000fffffff000ULL)==pages[i/4]+(i%4)*4096);\n    assert(bv_l3[0][0] & (1ULL<<7));assert(bv_l3[0][0] & (3ULL<<53));')
-main=main.replace('    return 0;\n}',r'''
+    for(unsigned i=0;i<8;i++) assert((bv_l3[0][i] & 0x000000fffffff000ULL)==pages[i/4]+(i%4)*4096);
+    assert(bv_l3[0][0] & (1ULL<<7));assert(bv_l3[0][0] & (3ULL<<53));
+
     uint64_t b=bluejay_gpu_map(pages,1,false,false);assert(b==BV_BASE+3*PAGE_SIZE);
     assert(!bluejay_gpu_unmap(0,1));assert(!bluejay_gpu_unmap(BV_BASE+1,1));
     assert(bluejay_gpu_unmap(a,2));assert(!bv_l3[0][0]&&!bv_l3[0][7]);
@@ -99,7 +95,8 @@ main=main.replace('    return 0;\n}',r'''
     for(unsigned i=0;i<nalloc;i++) free(allocations[i]);
     puts("PASS GPU VM permissions, guard/reuse, parameters, job slots and fault quarantine (mock hardware)");
     return 0;
-}''')
+}
+'''
 with tempfile.TemporaryDirectory() as d:
     p=Path(d);(p/'test.c').write_text(const+'\n'+pre+'\n'+backend+'\n'+main)
     subprocess.run(['clang','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(p/'test.c'),'-o',str(p/'test')],check=True)
