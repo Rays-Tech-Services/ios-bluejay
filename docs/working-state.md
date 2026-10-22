@@ -176,3 +176,29 @@ Added attach and rx/tx taps (same header-stripping convention as if_fake.c).
 Added sweetusblogip bootarg to select192.168.2.1 (0xc0a80201) for shared
 subnet and retained unsent log cursor until a route becomes ready.
 Next kernel CI needed. No HTTP internet success established yet.
+
+
+## GPU handoff execution (2026-10-22)
+
+Followed docs/codex-handoff.md. GPU self-test commit 6758b5b CI 39720181424
+succeeded; kernel SHA256
+4cbde719590bdc8c8e9ffb99df0ba93dca18a6a23ab3e2a09769dd8483601865.
+All QEMU smoke checks passed through root mount and launchd exec.
+Temporary phone boot out/phone-gpu1/boot.img (SHA256
+c988a763a0d447e8965ead26005cbcf1a30bfa81c073134eb5a80997d71322bb)
+succeeded after recording notice; old payload/boot reproduced byte-exact,
+known-good shim and ADT retained. User reported phone booting. USB Ethernet
+and live userspace logs verified in out/gpu1-phone.log, but early GPU output
+was missed. GPU identity/power/job execution are NOT yet verified. No flash.
+
+Applied and exported ios-sailfish patches 0104/0163/0139, credited joranv1:
+9379db4 pushed. CI 39721582704 was cancelled by the workflow's concurrency
+rule when 56100c6 superseded it; cancellation is not a compilation result.
+56100c6 adds bounded sweetgpu_delay=0..300 seconds so logging can be ready
+before the one-shot probe. Its CI run 39722154343 is pending completion.
+Reproducible sanitized host checks: python3 tools/kernel-policy-test.py
+passes all three test groups (selection/bounds, argument-space/string-copy
+errors, AMFI policy/copy errors). Source whitespace and exported patch
+reverse-application checks pass. Full IOSurface review and next gates are
+in docs/gpu-bringup.md. SweetGPU, Panfrost sweetgl and root deployment remain
+pending; the existing userdata-wipe prohibition remains in effect.
