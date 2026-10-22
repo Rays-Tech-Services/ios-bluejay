@@ -133,10 +133,10 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..fd62303
+index 0000000..dc3daca
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
-@@ -0,0 +1,727 @@
+@@ -0,0 +1,744 @@
 +/*
 + * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
 + * sweetgpu=N, run once after the root mounts, everything logged:
@@ -158,8 +158,8 @@ index 0000000..fd62303
 + * become reachable before the one-shot diagnostic runs (default: no delay).
 + * sweetgpuprobe=1: probe-only session (ACPM clock/rail report, no iOS, then
 + * power off after sweetgpuprobe_wait seconds); see bg_acpm_report().
-+ * sweetgpurail=1 (with sweetgpuprobe=1): switch the shader rail BUCK2S on
-+ * before the power test; see bg_rail_on().
++ * Level 2 and up first switch the shader rail BUCK2S on (ABL leaves it off;
++ * sweetgpurail=0 skips that); see bg_rail_on().
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -645,8 +645,9 @@ index 0000000..fd62303
 +}
 +
 +/*
-+ * sweetgpurail=1 (probe sessions only): switch BUCK2S (VDD_G3D, the shader
-+ * cores' rail; ABL leaves it OFF while BUCK8S, the L2 rail, is ON) on, as
++ * Before the power-on (sweetgpu>=2; sweetgpurail=0 skips it): switch
++ * BUCK2S (VDD_G3D, the shader cores' rail; ABL leaves it OFF while BUCK8S,
++ * the L2 rail, is ON) on, as
 + * Linux's regulator framework does for the Pixel 6 panfrost "mali" supply.
 + * The voltage is not touched and must already be in the operating range
 + * (gs101 BUCK2S 450-1300 mV; refuse outside 500-900 mV). One write, CTRL
@@ -662,33 +663,47 @@ index 0000000..fd62303
 +	}
 +	unsigned mv = 200u + o * 25u / 4u;
 +	if (e || mv < 500 || mv > 900) {
-+		printf("BLUEJAY GPU PROBE: BUCK2S not enabled (ctrl 0x%02x, %u mV, err %d)\n", c, mv, e);
++		printf("BLUEJAY GPU: BUCK2S not enabled (ctrl 0x%02x, %u mV, err %d)\n", c, mv, e);
 +		return;
 +	}
 +	if ((c >> 6) == 3) {
-+		printf("BLUEJAY GPU PROBE: BUCK2S already on\n");
++		printf("BLUEJAY GPU: BUCK2S already on\n");
 +		return;
 +	}
 +	e = bg_pmic_update(1, 0x15, 0xc0, 0xc0);
 +	uint8_t after = 0;
 +	int e2 = bg_pmic_read(1, 0x15, &after);
 +	bg_sleep_ms(5);                 /* 600 mV at 12.5 mV/us: well under 1 ms */
-+	printf("BLUEJAY GPU PROBE: BUCK2S enable: ctrl 0x%02x -> 0x%02x at %u mV (err %d/%d) %s\n",
++	printf("BLUEJAY GPU: BUCK2S enable: ctrl 0x%02x -> 0x%02x at %u mV (err %d/%d) %s\n",
 +	    c, after, mv, e, e2, (after >> 6) == 3 ? "ON" : "NOT ON");
++}
++
++/* Map ACPM once; refused while SweetBattery's thermal governor uses it. */
++static bool
++bg_acpm_map(void)
++{
++	int thermal = 0;
++	if (PE_parse_boot_argn("sweetthermal", &thermal, sizeof(thermal)) && thermal) {
++		printf("BLUEJAY GPU: sweetthermal owns ACPM; GPU rails not touched\n");
++		return false;
++	}
++	if (!bg_apm) {
++		bg_apm = ml_io_map(BG_APM_SRAM_PA, BG_APM_SRAM_SIZE);
++	}
++	if (!bg_mbox) {
++		bg_mbox = ml_io_map(BG_AP2APM_MBOX_PA, 0x1000);
++	}
++	if (!bg_apm || !bg_mbox) {
++		printf("BLUEJAY GPU: failed to map ACPM\n");
++		return false;
++	}
++	return true;
 +}
 +
 +static void
 +bg_acpm_report(void)
 +{
-+	int thermal = 0;
-+	if (PE_parse_boot_argn("sweetthermal", &thermal, sizeof(thermal)) && thermal) {
-+		printf("BLUEJAY GPU PROBE: sweetthermal owns ACPM; not queried\n");
-+		return;
-+	}
-+	bg_apm = ml_io_map(BG_APM_SRAM_PA, BG_APM_SRAM_SIZE);
-+	bg_mbox = ml_io_map(BG_AP2APM_MBOX_PA, 0x1000);
-+	if (!bg_apm || !bg_mbox) {
-+		printf("BLUEJAY GPU PROBE: failed to map ACPM\n");
++	if (!bg_acpm_map()) {
 +		return;
 +	}
 +	static const struct { uint32_t id; const char *name; } dom[] = {
@@ -729,10 +744,6 @@ index 0000000..fd62303
 +		uint8_t v = 0;
 +		int e = bg_pmic_read(sel[i].speedy, sel[i].reg, &v);
 +		printf("BLUEJAY GPU PROBE: %s 0x%02x (err %d)\n", sel[i].name, v, e);
-+	}
-+	int rail_on = 0;
-+	if (PE_parse_boot_argn("sweetgpurail", &rail_on, sizeof(rail_on)) && rail_on == 1) {
-+		bg_rail_on();
 +	}
 +}
 +
@@ -812,6 +823,12 @@ index 0000000..fd62303
 +	bg_features();
 +	if (level < 2) {
 +		return;
++	}
++	/* ABL leaves the shader rail off: without it the cores never power up. */
++	int rail_on = 1;
++	PE_parse_boot_argn("sweetgpurail", &rail_on, sizeof(rail_on));
++	if (rail_on == 1 && bg_acpm_map()) {
++		bg_rail_on();
 +	}
 +	if (!bg_power() || level < 3) {
 +		return;
