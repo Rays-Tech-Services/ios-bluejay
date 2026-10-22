@@ -700,3 +700,22 @@ SHA256 `a6ee63f62407e183e153ce33cd730431ddc499b58dc3da1092d4159eaf9bd49b`
 query returns error 1 (no ACPM firmware), shim halts. Phone run pending.
 Hypothesis under test (unverified): the shader clock domain G3D is stopped,
 which would explain L2/tiler ready but shader power-on timing out.
+
+Self-reporting GPU probe (2026-10-22, physical phone): commit e8b975d, CI
+39836205154, kernel SHA256 `405ffa27e61613735adde86b1bbf9c012e1e213de5f2465d6d450597de335e96`,
+image out/phone-gpu-probe/boot.img SHA256
+`a5798784caa68da50f5a78184dcc2fb3bbe2768215db907aeb618873b852f1a7`
+(read-only root, hold before root mount, `sweetgpuprobe=1`). QEMU: hold
+reached, GPU skipped on the emulated board, no panic. Phone: results arrived
+over the USB log (out/gpu-probe-phone.log); after the 3-2-1 countdown the
+power-off fell back to the bootloader reset (USB power), phone in fastboot.
+
+Result, ACPM reads: G3D 151000 kHz, G3DL2 151000 kHz, CPUCL0 1197000 kHz.
+S2MPG11 BUCK2S (VDD_G3D, shader cores) CTRL 0x38 = mode OFF (bits 7:6 = 0),
+OUT1 0x40 (600 mV), PCTRLSEL1 0x73 (pin G3D_EN, unused while OFF).
+BUCK8S (VDD_G3D_L2) CTRL 0xd8 = ON, 600 mV. LDO1S (VDD_G3D_M) CTRL 0x24,
+enable bits [5:4] = 2 (meaning not yet confirmed). S2MPG10 BUCK7M (VDD_INT_M)
+CTRL 0x58 = external pin, 750 mV. Conclusion: the shader-core rail is off;
+ABL powers only the L2 rail. Linux panfrost enables all four GPU supplies
+through the regulator framework; our kernel enables none. Next: one PMIC
+write, BUCK2S CTRL bits 7:6 = 11 (on), then the level-2 power test.

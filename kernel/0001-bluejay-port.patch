@@ -133,10 +133,10 @@ index c640939..a2c2826 100644
  		return a40_platform();
 diff --git a/bsd/dev/bluejay_gpu.c b/bsd/dev/bluejay_gpu.c
 new file mode 100644
-index 0000000..135e0a4
+index 0000000..94a4766
 --- /dev/null
 +++ b/bsd/dev/bluejay_gpu.c
-@@ -0,0 +1,674 @@
+@@ -0,0 +1,727 @@
 +/*
 + * Pixel 6a (gs101) Mali-G78 MP20 bring-up self-test. Opt-in: boot-arg
 + * sweetgpu=N, run once after the root mounts, everything logged:
@@ -158,6 +158,8 @@ index 0000000..135e0a4
 + * become reachable before the one-shot diagnostic runs (default: no delay).
 + * sweetgpuprobe=1: probe-only session (ACPM clock/rail report, no iOS, then
 + * power off after sweetgpuprobe_wait seconds); see bg_acpm_report().
++ * sweetgpurail=1 (with sweetgpuprobe=1): switch the shader rail BUCK2S on
++ * before the power test; see bg_rail_on().
 + */
 +#include <sys/param.h>
 +#include <sys/systm.h>
@@ -622,6 +624,60 @@ index 0000000..135e0a4
 +}
 +
 +static void
++bg_sleep_ms(uint32_t ms)
++{
++	assert_wait_timeout((event_t)&bg_acpm_seq, THREAD_UNINT, ms, NSEC_PER_MSEC);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* PMIC read-modify-write in the firmware (ACPM_PMIC_UPDATE, func 2). */
++static int
++bg_pmic_update(uint32_t speedy, uint8_t reg, uint8_t value, uint8_t mask)
++{
++	uint32_t w1 = 0;
++	uint32_t cmd[4] = { speedy << 12 | 1u << 8 | reg,
++		            (uint32_t)mask << 16 | (uint32_t)value << 8 | 2, 0, (uint32_t)bg_ms() };
++	int e = bg_acpm_xfer(BG_ACPM_PMIC_CHAN, cmd, &w1);
++	if (e) {
++		return e;
++	}
++	return (w1 >> 24) ? -(int)(w1 >> 24) - 10 : 0;
++}
++
++/*
++ * sweetgpurail=1 (probe sessions only): switch BUCK2S (VDD_G3D, the shader
++ * cores' rail; ABL leaves it OFF while BUCK8S, the L2 rail, is ON) on, as
++ * Linux's regulator framework does for the Pixel 6 panfrost "mali" supply.
++ * The voltage is not touched and must already be in the operating range
++ * (gs101 BUCK2S 450-1300 mV; refuse outside 500-900 mV). One write, CTRL
++ * bits 7:6 = 11, read back. Power off undoes it.
++ */
++static void
++bg_rail_on(void)
++{
++	uint8_t c = 0, o = 0;
++	int e = bg_pmic_read(1, 0x15, &c);
++	if (!e) {
++		e = bg_pmic_read(1, 0x16, &o);
++	}
++	unsigned mv = 200u + o * 25u / 4u;
++	if (e || mv < 500 || mv > 900) {
++		printf("BLUEJAY GPU PROBE: BUCK2S not enabled (ctrl 0x%02x, %u mV, err %d)\n", c, mv, e);
++		return;
++	}
++	if ((c >> 6) == 3) {
++		printf("BLUEJAY GPU PROBE: BUCK2S already on\n");
++		return;
++	}
++	e = bg_pmic_update(1, 0x15, 0xc0, 0xc0);
++	uint8_t after = 0;
++	int e2 = bg_pmic_read(1, 0x15, &after);
++	bg_sleep_ms(5);                 /* 600 mV at 12.5 mV/us: well under 1 ms */
++	printf("BLUEJAY GPU PROBE: BUCK2S enable: ctrl 0x%02x -> 0x%02x at %u mV (err %d/%d) %s\n",
++	    c, after, mv, e, e2, (after >> 6) == 3 ? "ON" : "NOT ON");
++}
++
++static void
 +bg_acpm_report(void)
 +{
 +	int thermal = 0;
@@ -674,13 +730,10 @@ index 0000000..135e0a4
 +		int e = bg_pmic_read(sel[i].speedy, sel[i].reg, &v);
 +		printf("BLUEJAY GPU PROBE: %s 0x%02x (err %d)\n", sel[i].name, v, e);
 +	}
-+}
-+
-+static void
-+bg_sleep_ms(uint32_t ms)
-+{
-+	assert_wait_timeout((event_t)&bg_acpm_seq, THREAD_UNINT, ms, NSEC_PER_MSEC);
-+	thread_block(THREAD_CONTINUE_NULL);
++	int rail = 0;
++	if (PE_parse_boot_argn("sweetgpurail", &rail, sizeof(rail)) && rail == 1) {
++		bg_rail_on();
++	}
 +}
 +
 +/* After the report: give the USB log time to reach the host, then 3-2-1 off. */
