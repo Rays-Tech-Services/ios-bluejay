@@ -53,7 +53,8 @@ static unsigned char gpu[32768] __attribute__((aligned(16384)));
 static vm_offset_t bg_regs;
 static int level, seconds, board, property, qsize, power_ok;
 static uint32_t qvalue;
-static unsigned maps, features, powers, jobs, starts, sleeps, interval;
+static unsigned maps, features, powers, jobs, starts, sleeps, interval, initialized;
+static bool job_ok;
 static bool fail_pmu_map, fail_gpu_map, fail_start;
 static int PE_parse_boot_argn(const char *name, void *value, size_t size) {
     assert(size == sizeof(int));
@@ -86,8 +87,8 @@ static uint32_t gpu_rd(uint32_t offset) { assert(offset == GPU_ID); return *(uin
 static void bg_features(void) { features++; }
 static bool bg_power(void) { powers++; return power_ok; }
 static bool bg_job_success;
-static bool bv_init(void) { return true; }
-static void bg_job_test(void) { jobs++; }
+static bool bv_init(void) { initialized++; return true; }
+static void bg_job_test(void) { jobs++; bg_job_success = job_ok; }
 static int kernel_thread_start(void (*fn)(void *, int), void *arg, thread_t *thread) {
     starts++; if (fail_start) return 1; *thread = 1; fn(arg, 0); return 0;
 }
@@ -97,7 +98,8 @@ main = r'''
 static void reset(void) {
     memset(pmu, 0, sizeof(pmu)); memset(gpu, 0, sizeof(gpu));
     level = 1; seconds = 0; board = property = 1; qsize = 4; qvalue = 0;
-    power_ok = 1; maps = features = powers = jobs = starts = sleeps = interval = 0;
+    power_ok = 1; maps = features = powers = jobs = starts = sleeps = interval = initialized = 0;
+    job_ok = true; bg_job_success = false;
     fail_pmu_map = fail_gpu_map = fail_start = false;
     *(uint32_t *)(pmu + 0x1e00) = 1; *(uint32_t *)(pmu + 0x1e04) = 1;
     *(uint32_t *)(pmu + 0x2004) = 1; *(uint32_t *)gpu = 0x92020010;
@@ -123,6 +125,9 @@ int main(void) {
     reset(); seconds = 301; bluejay_gpu_start(); assert(!sleeps);
     reset(); seconds = 300; bluejay_gpu_start(); assert(sleeps == 1 && interval == 300000);
     reset(); seconds = 30; bluejay_gpu_start(); assert(sleeps == 1 && interval == 30000);
+    reset(); level = 4; bluejay_gpu_start(); assert(jobs == 1 && initialized == 1);
+    reset(); level = 4; job_ok = false; bluejay_gpu_start(); assert(jobs == 1 && !initialized);
+    reset(); level = 4; power_ok = 0; bluejay_gpu_start(); assert(!jobs && !initialized);
     return 0;
 }
 '''
@@ -137,4 +142,4 @@ with tempfile.TemporaryDirectory(prefix='gpu-guard-test-', dir=ROOT / 'out') as 
     subprocess.run([os.environ.get('CC', 'clang'), '-std=c11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', str(cfile), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True, capture_output=True)
-print('PASS 20 sanitized GPU probe gate cases (mock hardware only)')
+print('PASS 23 sanitized GPU probe gate cases (mock hardware only)')

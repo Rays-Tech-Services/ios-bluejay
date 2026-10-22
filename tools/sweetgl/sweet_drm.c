@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <IOKit/IOKitLib.h>
+#include <mach/vm_page_size.h>
 
 #include "xf86drm.h"
 #include "drm-uapi/panfrost_drm.h"
@@ -273,7 +274,9 @@ sweet_drm_import_iosurface(uint32_t surface_id, uint64_t map, uint32_t *handle, 
 	uint64_t in = surface_id, out[3];
 	int ret = scalar(SWEET_GPU_IMPORT_SURFACE, &in, 1, out, 3);
 	if (!ret) {
-		ret = add_bo(out[0], out[1], map, out[2]);
+		/* The resource offset carries the pixels' displacement within this
+		 * page. Mesa maps the complete BO, so expose its page base here. */
+		ret = add_bo(out[0], out[1], map & ~(uint64_t)vm_page_mask, out[2]);
 		if (ret) scalar(SWEET_GPU_FREE_BO, out, 1, NULL, 0);
 		else { *handle = (uint32_t)out[0]; *size = out[2]; }
 	}

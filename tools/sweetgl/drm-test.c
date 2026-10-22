@@ -20,6 +20,10 @@ test_scalar(mach_port_t c, uint32_t selector, const uint64_t *in,
 		out[0] = mock_handle; out[1] = 0x1000000;
 		out[2] = 0x2000000; out[3] = (in[0] + 16383) & ~16383ull;
 		return KERN_SUCCESS;
+	case SWEET_GPU_IMPORT_SURFACE:
+		assert(nin == 1 && *nout == 3 && in[0] == 77);
+		out[0] = 2; out[1] = 0x1004000; out[2] = 16384;
+		return KERN_SUCCESS;
 	case SWEET_GPU_FREE_BO:
 		assert(nin == 1 && *nout == 0);
 		return fail_free ? kIOReturnError : KERN_SUCCESS;
@@ -112,6 +116,11 @@ main(void)
 	assert(drmPrimeFDToHandle(-1, duplicate, &imported) == -ENOENT);
 	assert(sweet_drm_bo_map(-1, 1ull << 32) == MAP_FAILED);
 	close(proxy); close(duplicate);
+	uint32_t surface_handle = 0; uint64_t surface_size = 0;
+	assert(sweet_drm_import_iosurface(77, 0x2000080, &surface_handle, &surface_size) == 0);
+	assert(surface_handle == 2 && surface_size == 16384);
+	assert(sweet_drm_bo_map(-1, 2ull << 32) == (void *)0x2000000);
+	assert(drmCloseBufferHandle(-1, 2) == 0);
 	connection = 0;
 	assert(drmIoctl(-1, DRM_IOCTL_PANFROST_GET_PARAM, &param) == -ENODEV);
 	return 0;
