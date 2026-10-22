@@ -951,6 +951,42 @@ index d2f81be..f02590b 100644
  
  	if (load_result.unixproc) {
  		user_addr_t     ap;
+diff --git a/iokit/Kernel/IOService.cpp b/iokit/Kernel/IOService.cpp
+index 59c834e..e26ca5e 100644
+--- a/iokit/Kernel/IOService.cpp
++++ b/iokit/Kernel/IOService.cpp
+@@ -1200,7 +1200,9 @@ IOService::iokitDaemonLaunched(void)
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
++#if !defined(ARM64_BOARD_CONFIG_SWEET)                  /* no hold taken (IOStartIOKit.cpp) */
+ 	getServiceRoot()->adjustBusy(-1);
++#endif
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+diff --git a/iokit/Kernel/IOStartIOKit.cpp b/iokit/Kernel/IOStartIOKit.cpp
+index d74c063..75f6eca 100644
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -188,7 +188,17 @@ StartIOKitMatching(void)
+ 	}
+ 
+ #if !NO_KEXTD
++	/*
++	 * SWEET: iOS has no IOKit daemon (kernelmanagerd) to report its launch, so
++	 * this hold kept the registry root busy for good: IOKit never quiesced
++	 * (IOKitWaitQuiet callers, configd's InterfaceNamer). From ios-sailfish
++	 * 0166 / the ios-topaz fork.
++	 */
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (OSKext::iokitDaemonAvailable()) {
++#else
++	if (false) {
++#endif
+ 		/* Add a busy count to keep the registry busy until the IOKit daemon has
+ 		 * completely finished launching. This is decremented when the IOKit daemon
+ 		 * messages the kernel after the in-kernel linker has been
 diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
 index 9969739..5c05358 100644
 --- a/iokit/Kernel/arm/SweetBattery.cpp
@@ -1400,7 +1436,7 @@ index 6114e30..ba63bca 100644
  }
  
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index d8a7f5a..f43e4f9 100644
+index d8a7f5a..537f75b 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -82,6 +82,23 @@ enum {
@@ -1446,7 +1482,7 @@ index d8a7f5a..f43e4f9 100644
  
  	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
  	void addClient(IOMobileFramebufferUserClient *client);
-@@ -127,6 +156,9 @@ public:
+@@ -127,10 +156,26 @@ public:
  	void present(const uint8_t *rec);
  	void presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
  	    int32_t dx, int32_t dy, int32_t w, int32_t h);
@@ -1456,7 +1492,24 @@ index d8a7f5a..f43e4f9 100644
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -218,12 +250,70 @@ AppleCLCD::start(IOService *provider)
+ 
++/*
++ * The GPU's service class as QuartzCore looks for it: CAMetalContextCreate
++ * polls IOServiceMatching("IOAcceleratorES") 300 times, 100 ms apart, in
++ * every process that sets up CA rendering (30 s in backboardd at each boot).
++ * This one has no MetalPluginName, so Metal passes over it and CA keeps its
++ * software path. Boot-arg sweetaccel=0 leaves it out. From ios-sailfish 0166.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -218,12 +263,77 @@ AppleCLCD::start(IOService *provider)
  	uint32_t hz = 10;
  	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
@@ -1497,6 +1550,13 @@ index d8a7f5a..f43e4f9 100644
  	setProperty("external", false);
  	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
  	registerService();
++	int accel = 1;
++	PE_parse_boot_argn("sweetaccel", &accel, sizeof(accel));
++	IOAcceleratorES *es = accel ? OSTypeAlloc(IOAcceleratorES) : NULL;
++	if (es != NULL && es->init() && es->attach(this)) {
++		es->registerService();
++	}
++	OSSafeReleaseNULL(es);
 +#if defined(SWEET_BOARD_BLUEJAY)
 +	/* sweetfb_dpuprobe=1: read-only dump of the scanout DMA, the first step
 +	 * towards page flipping (which layer reads the ABL framebuffer, with
@@ -1527,7 +1587,7 @@ index d8a7f5a..f43e4f9 100644
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
  	return true;
-@@ -235,12 +325,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -235,12 +345,18 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -1546,7 +1606,7 @@ index d8a7f5a..f43e4f9 100644
  	IOLockLock(fb->fLock);
  	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
  		IOMobileFramebufferUserClient *client =
-@@ -253,6 +349,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -253,6 +369,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  		if (step <= 6) {
  			fb->fFadeStep = step + 1;
  		}
@@ -1554,7 +1614,7 @@ index d8a7f5a..f43e4f9 100644
  		IOLockUnlock(fb->fLock);
  		if (step <= 6) {
  			for (uint32_t y = 0; y < fb->fHeight; y++) {
-@@ -276,8 +373,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -276,8 +393,13 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	}
  	IOLockUnlock(fb->fLock);
  	if (rec != NULL) {
@@ -1568,7 +1628,7 @@ index d8a7f5a..f43e4f9 100644
  	}
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
-@@ -325,6 +427,7 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -325,6 +447,7 @@ AppleCLCD::swap(const uint8_t *rec)
  	IOLockLock(fLock);
  	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
  	fDirty = true;
@@ -1576,7 +1636,7 @@ index d8a7f5a..f43e4f9 100644
  	IOLockUnlock(fLock);
  	if ((++sweet_fb_swap_count % 1000) == 0) {
  		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
-@@ -347,6 +450,7 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -347,6 +470,7 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  	}
  
@@ -1584,7 +1644,7 @@ index d8a7f5a..f43e4f9 100644
  	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
  		uint32_t id = get32(rec, 0x54 + 4 * layer);
  		const uint8_t *a = rec + 0x64 + 16 * layer;
-@@ -420,16 +524,103 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -420,16 +544,103 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		if (src != 0 && bpe == 4) {
  			for (int32_t y = 0; y < h; y++) {

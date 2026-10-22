@@ -1,6 +1,7 @@
 # Upstream projects (separate git repos)
 /ios-sweet/
 /iOS16-on-A40/
+/ios-sailfish/
 
 # Patched XNU tree and build outputs
 /build/
