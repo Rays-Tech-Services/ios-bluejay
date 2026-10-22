@@ -195,7 +195,46 @@ Applied and exported ios-sailfish patches 0104/0163/0139, credited joranv1:
 9379db4 pushed. CI 39721582704 was cancelled by the workflow's concurrency
 rule when 56100c6 superseded it; cancellation is not a compilation result.
 56100c6 adds bounded sweetgpu_delay=0..300 seconds so logging can be ready
-before the one-shot probe. Its CI run 39722154343 is pending completion.
+before the one-shot probe. CI run 39722154343 failed because the new sleep
+calls lacked kern/sched_prim.h; 4107316 adds that header. Replacement CI
+39723013130 passed. Kernel SHA256:
+00e4ebd5ced81f373cc50e133c3674288188d95e4711e0d7c66628fa9610f426.
+All QEMU smoke checks passed (out/smoke-gpu-delay-fixed). Temporary delayed
+level-1 image out/phone-gpu1-delay/boot.img SHA256:
+435011a42a3718277ff7607ce754030559b088de4874f9c3ff3b52145310c373.
+Fastboot send/boot succeeded after recording notice. USB logs confirm the
+new command line, display and touch, but no GPU output after the delay.
+GPU identity and power remain unverified. 8e3a4e1 adds startup/access
+checkpoints and uses the verified shutdown path's firmware PMU read ABI;
+CI 39725175947 passed (kernel SHA256
+f8470601ee348db4639c3e4df7bca9182d88bf5a2c3e641895c01897d0334c69).
+QEMU smoke and explicit GPU emulation-guard checks passed. Temporary
+phone-gpu1-smc image dcb845ae7efe40873e77b101ac4eb408e7699f2b2b3e04a26d7baf2a53db35a7
+sent/booted OKAY; its capture again missed early checkpoints.
+3e39487 adds bounded opt-in retained USB boot-log replay. CI 39727087656
+passed; kernel SHA256 6224d7df80f8d77388a240d901007168de1f4146f66b12cbf7c963a2cb160292.
+QEMU boot and GPU guard checks passed (out/smoke-gpu-replay). Temporary image
+out/phone-gpu1-replay/boot.img SHA256
+6b007fc30261d5d0d8dff1f216a06b097681bf166f40117897245af0fde26895
+sent/booted OKAY after recording notice, with 30-second probe delay and six
+replays. After an initially empty capture, out/gpu1-replay-phone.log recovered
+825166 bytes: probe requested/started, config SMC returned 1, both status SMC
+reads returned -EINVAL (-22), so the guard correctly avoided GPU access.
+The firmware path added for status was incorrect: Linux reads PMU through
+MMIO because SMC reads support only writable registers. fa085af restores
+direct reads with individual checkpoints; CI 39730945390 is in progress.
+Twenty ASan/UBSan host cases of the actual probe gate logic pass via
+tools/gpu-probe-test.py (mock hardware). Log also confirms userspace/touch
+and a SpringBoard-initiated shutdown; phone later detected in fastboot.
+No failed-build image was booted, no partition flashed.
+
+dc05b26 adds draft Panfrost sweetgl, explicit user-client ABI and macOS iOS
+build CI. Host ASan/UBSan DRM checks, shell/Python syntax and Mesa patch
+synchronization pass. Kernel SweetGPU service, successful iOS dylib build and
+physical GPU execution remain pending. CI 39730620703 failed on missing native
+shim includes (fixed 5be060d); 39731037894 failed on sched_setscheduler (Darwin
+fix 3cce5ab). Replacement sweetgl CI 39731555134 is in progress.
+Detailed evidence: docs/gpu-bringup.md.
 Reproducible sanitized host checks: python3 tools/kernel-policy-test.py
 passes all three test groups (selection/bounds, argument-space/string-copy
 errors, AMFI policy/copy errors). Source whitespace and exported patch

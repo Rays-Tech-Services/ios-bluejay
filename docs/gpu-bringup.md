@@ -27,6 +27,86 @@ the diagnostic thread before any PMU/GPU access. Use a delayed level-1 test
 after CI and QEMU verification so USB logging is reachable first. Step up to
 levels 2 and 3 only after inspecting each preceding result.
 
+CI run `39722154343` failed to compile the delay change because the scheduler
+declarations were not included. Commit `4107316` adds `kern/sched_prim.h`;
+replacement CI run `39723013130` passed. Its kernel SHA256 is
+`00e4ebd5ced81f373cc50e133c3674288188d95e4711e0d7c66628fa9610f426`.
+All QEMU smoke checks passed (`out/smoke-gpu-delay-fixed/`). Temporary image
+`out/phone-gpu1-delay/boot.img`, SHA256
+`435011a42a3718277ff7607ce754030559b088de4874f9c3ff3b52145310c373`,
+booted successfully with recording notice and `sweetgpu_delay=120`.
+Live USB logs in `out/gpu1-delay-phone.log` confirm the new command line,
+display service and touch input, but contain no PMU/GPU probe messages even
+after the delay. This does not prove a GPU power state or explain whether
+the probe skipped or stalled. No failed-build image was packaged or booted.
+
+Commit `8e3a4e1` adds probe-start, guard, thread, delay and access-boundary
+checkpoints, and uses the firmware PMU read ABI from the verified PS_HOLD
+path instead of direct PMU MMIO. GPU registers remain guarded by a successful
+PMU response and the domain-on status bit. CI run `39725175947` passed;
+kernel SHA256 `f8470601ee348db4639c3e4df7bca9182d88bf5a2c3e641895c01897d0334c69`.
+All QEMU smoke checks passed with `sweetgpu=3`, including an explicit logged
+skip before any PMU access (`out/smoke-gpu-smc/`). Temporary level-1 image
+`out/phone-gpu1-smc/boot.img`, SHA256
+`dcb845ae7efe40873e77b101ac4eb408e7699f2b2b3e04a26d7baf2a53db35a7`,
+was sent and booted successfully. Its USB capture again started after early
+startup messages; GPU execution remains unverified.
+
+Commit `3e39487` adds opt-in `sweetusblogreplay=1..6`, replaying the retained
+ring at ten-second intervals after USB configuration. This handles UDP sends
+accepted before the host's interface/route is ready. Default logging remains
+unchanged. Mac interface-selection host tests passed. CI `39727087656` passed;
+kernel SHA256 `6224d7df80f8d77388a240d901007168de1f4146f66b12cbf7c963a2cb160292`.
+QEMU boot and explicit GPU-guard checks passed (`out/smoke-gpu-replay/`).
+Temporary image `out/phone-gpu1-replay/boot.img`, SHA256
+`6b007fc30261d5d0d8dff1f216a06b097681bf166f40117897245af0fde26895`,
+uses a 30-second delay and six boot-log replays. Fastboot send and boot both
+returned OKAY after recording notice. The capture was initially empty after
+user pause/continue, then recovered 825166 bytes including the early probe:
+
+```
+BLUEJAY GPU: requested 1 level 1
+BLUEJAY GPU: start level 1 thread result 0
+BLUEJAY GPU: starting level 1; reading PMU through firmware
+BLUEJAY GPU: PD_G3D config SMC 0x1
+BLUEJAY GPU: PD_G3D status SMC 0xffffffffffffffea
+BLUEJAY GPU: G3D cores status SMC 0xffffffffffffffea
+BLUEJAY GPU: firmware PMU read failed; GPU not touched
+```
+
+The probe did run; the firmware status-read path was wrong. Linux's
+[Tensor PMU implementation](https://github.com/torvalds/linux/blob/master/drivers/soc/samsung/exynos-pmu.c)
+uses MMIO reads because the SMC interface reads only writable registers.
+Commit `fa085af` restores direct PMU reads with per-read checkpoints while
+retaining replay and the domain-on guard. CI run `39730945390` is in progress.
+`python3 tools/gpu-probe-test.py` passes 20 ASan/UBSan cases for the actual
+probe control flow, including board/QEMU guards, power-off/invalid status,
+mapping/start failures, levels and delay bounds. Hardware operations are mocked.
+
+The phone log also contains userspace/touch activity and a shutdown initiated
+by SpringBoard. The phone subsequently appeared in fastboot. This is not GPU
+execution or visual-compositor evidence; levels 2/3 remain pending.
+
+## sweetgl development
+
+Commit `dc05b26` adds the Panfrost user-space bridge, a versioned SweetGPU ABI
+contract, the reused EAGL/dispatch/layer helpers, the G78 model patch and a
+macOS iOS-build workflow. Sources and credits are in `tools/sweetgl/README.md`.
+The draft translates parameter queries, create/free, mmap offsets, IOSurface
+imports, synchronous submissions, waits, madvise and same-process FD proxies.
+The kernel SweetGPU service is not implemented yet, so this is not a working
+renderer. Prime proxies are valid only in-process while the BO remains alive.
+
+Strict host compilation and ASan/UBSan checks pass for buffer bounds, stale
+handles, submission failures and FD-proxy identity. Shell syntax, dispatch
+generator syntax and Mesa patch synchronization checks pass. Full iOS build
+validation is running in `sweetgl-bluejay`; device injection/rendering remains
+pending. The first CI run `39730620703` reached native tools then failed to
+find xf86drm.h; `5be060d` adds the native include path. Run `39731037894` then
+failed on Linux-only sched_setscheduler; `3cce5ab` adapts it to Darwin pthread
+scheduling. Replacement run `39731555134` is in progress. The new Mesa checkout
+is pinned rather than following a moving branch.
+
 ## Environment and dyld milestone
 
 Commit `9379db4` imports ios-sailfish patches 0104, 0163 and 0139 by joranv1,
@@ -70,5 +150,5 @@ CI compilation, QEMU and later device injection remain separate evidence.
   mappings and buffer lifetime management in the new driver.
 
 These review findings have not been applied as additional IOSurface changes.
-SweetGPU/Panfrost and sweetgl are still pending. Root deployment requires a
+SweetGPU and physical Panfrost/sweetgl validation are still pending. Root deployment requires a
 new explicit userdata-wipe approval, as specified in the handoff.
