@@ -30,7 +30,7 @@ index 995224a..653c88a 100644
     bo->ptr.cpu = NULL;
  }
 diff --git a/src/panfrost/lib/kmod/panfrost_kmod.c b/src/panfrost/lib/kmod/panfrost_kmod.c
-index 9b7010d..c028bb6 100644
+index 9b7010d..ef50297 100644
 --- a/src/panfrost/lib/kmod/panfrost_kmod.c
 +++ b/src/panfrost/lib/kmod/panfrost_kmod.c
 @@ -25,6 +25,13 @@
@@ -46,6 +46,20 @@ index 9b7010d..c028bb6 100644
 +
  /* Maximum kmod BO label length, including NUL-terminator */
  #define PANFROST_BO_LABEL_MAXLEN 4096
+ 
+@@ -898,7 +905,13 @@ panfrost_kmod_perf_thread(void *data)
+    /* This is best effort. If we can't make the thread RT because we don't
+     * have CAP_SYS_NICE, we keep going.
+     */
++#ifdef __APPLE__
++   int ret = pthread_setschedparam(pthread_self(), SCHED_FIFO, &rt_params);
++   if (ret)
++      errno = ret;
++#else
+    int ret = sched_setscheduler(0, SCHED_FIFO, &rt_params);
++#endif
+    if (ret)
+       mesa_logw("Can't make the perfcnt thread RT (err=%d)", errno);
  
 diff --git a/src/panfrost/model/pan_model.c b/src/panfrost/model/pan_model.c
 index d9bdd28..8424177 100644
