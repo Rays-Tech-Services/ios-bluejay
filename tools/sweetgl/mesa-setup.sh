@@ -46,7 +46,8 @@ COMMON=(--buildtype=release -Db_ndebug=true -Ddefault_library=static
   -Dbuild-tests=false -Dshader-cache=disabled -Dperfetto=false
   -Dgallium-va=disabled -Dgallium-rusticl=false -Dhtml-docs=disabled
   -Ddisplay-info=disabled -Dteflon=false -Dpanfrost-rust=false)
-CC="$LLVM/bin/clang" CXX="$LLVM/bin/clang++" meson setup "$N" "$M" \
+CC="$LLVM/bin/clang" CXX="$LLVM/bin/clang++" \
+  CFLAGS="-I$H/include" CXXFLAGS="-I$H/include" meson setup "$N" "$M" \
   "${COMMON[@]}" --prefix "$PREFIX" -Dgallium-drivers= -Dopengl=false \
   -Dtools=panfrost -Dllvm=enabled -Dmesa-clc=enabled \
   -Dinstall-mesa-clc=true -Dprecomp-compiler=enabled \
