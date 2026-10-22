@@ -732,3 +732,14 @@ Power test: **L2 ok (0x1), shader ok (0x779fff, all 20 cores), tiler ok
 fastboot after the countdown. Next: level 3 (AS0 + WRITE_VALUE job), then
 make the rail enable part of normal GPU bring-up (sweetgpu>=2) and retry
 the renderer boot with the sweetgl no-GPU fallback.
+
+First GPU job on the phone (2026-10-22 16:13): same kernel (c6b8b422...),
+image out/phone-gpu-job/boot.img SHA256
+`24a867fbf2200e0650e56d48df425fa497ea419fe0cb9132c1761f4f6e02f769`
+(`sweetgpu=3 sweetgpuprobe=1 sweetgpurail=1`), log out/gpu-job-phone.log.
+BUCK2S CTRL 0x38 -> 0xf8 (bit 0 differs between runs: status, not ours).
+L2/shader (0x779fff)/tiler ok; AS0 48-bit VA, 4 levels, transcfg 0x410001c6;
+WRITE_VALUE job on JS1: JOB_INT_RAWSTAT 0x2, JS1_STATUS 0x0, target
+0xcafef00d (**GPU WROTE IT**); no MMU or GPU fault. The Mali-G78 runs jobs
+through its MMU. After the countdown the phone reset into fastboot. Next: rail enable in normal GPU bring-up, sweetgl rebuild
+with the no-GPU fallback, root rebuild (userdata flash needs Ray's OK).
